@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""hashrelay: a stratum relay with real share hashes (Python standard library only).
+"""bitsrelay: a stratum relay with real share hashes (Python standard library only).
 
 Your miner connects here (port 23340) instead of straight to your pool port (for example DATUM Gateway on this
-Umbrel). Every byte is passed on unchanged. For each share the pool accepts, hashrelay works out the real
+Umbrel). Every byte is passed on unchanged. For each share the pool accepts, bitsrelay works out the real
 BLAKE2b hash of the share (the hash a block would need to beat) and offers it to the hashes.space dashboard,
 so the bits that fly into the block there are the real bits of your miner's work.
 
@@ -177,7 +177,7 @@ async def relay(client_r, client_w):
 
 # ---------------------------------------------------------------- web page and API
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>hashrelay</title><style>
+<title>bitsrelay</title><style>
 :root{--bg:#10131c;--card:#1b1f2e;--line:#2b3146;--text:#eef0f6;--muted:#9aa3bd;--ok:#6fd286;--bad:#ff8a80;--link:#1bd8f4}
 @media(prefers-color-scheme:light){:root{--bg:#f4f5f9;--card:#fff;--line:#dcdfe9;--text:#161a28;--muted:#5d6580;--ok:#1c8a3a;--bad:#c62828;--link:#0a7f94}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}
@@ -190,12 +190,12 @@ input{font:inherit;padding:8px 10px;border-radius:6px;border:1px solid var(--lin
 button{font:inherit;font-weight:600;padding:8px 14px;border-radius:6px;border:0;background:var(--link);color:#001;cursor:pointer}
 form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-left:18px}li{margin:3px 0}.ok{color:var(--ok)}.bad{color:var(--bad)}
 </style></head><body><main>
-<h1>hashrelay</h1>
+<h1>bitsrelay</h1>
 <p class="muted">A relay between your miner and your pool port. It passes everything on unchanged and works out the real hash of every accepted share for the hashes.space dashboard.</p>
 <div class="card"><div class="stats">
 <div><b id="miners">–</b><span>miners connected</span></div><div><b id="checked">–</b><span>real hashes</span></div><div><b id="failed">–</b><span>failed the check</span></div></div></div>
 <div class="card"><h2>Point your miner here</h2>
-<p class="muted">In your miner's pool settings use this Umbrel's address and port <b>__PORT__</b>, with the worker name you use now, for example <code>stratum+tcp://umbrel.local:__PORT__</code> (or the IP address of your Umbrel). Keep your old pool as a second pool: if hashrelay ever stops, the miner falls back to it.</p></div>
+<p class="muted">In your miner's pool settings use this Umbrel's address and port <b>__PORT__</b>, with the worker name you use now, for example <code>stratum+tcp://umbrel.local:__PORT__</code> (or the IP address of your Umbrel). Keep your old pool as a second pool: if bitsrelay ever stops, the miner falls back to it.</p></div>
 <div class="card"><h2>Pool port to forward to</h2>
 <form id="f"><input id="h" aria-label="Pool host" value="__HOST__" size="26"><input id="p" aria-label="Pool port" value="__UPPORT__" size="7" inputmode="numeric"><button>Save</button><span id="msg" class="muted"></span></form>
 <p class="muted">The stratum address of the pool your miner hashes on now, for example DATUM Gateway on this Umbrel. <code>host.docker.internal</code> is this Umbrel itself.</p></div>
@@ -280,7 +280,7 @@ async def main():
     os.makedirs(DATA, exist_ok=True)
     await asyncio.start_server(relay, '0.0.0.0', STRATUM_PORT)
     await asyncio.start_server(web, '0.0.0.0', WEB_PORT)
-    note(f"hashrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
+    note(f"bitsrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
     await asyncio.Event().wait()
 
 

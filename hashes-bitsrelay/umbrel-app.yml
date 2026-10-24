@@ -1,7 +1,7 @@
 manifestVersion: 1
-id: hashes-hashrelay
+id: hashes-bitsrelay
 category: crypto
-name: hashrelay
+name: bitsrelay
 version: "1.0.0"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
@@ -13,7 +13,7 @@ description: >-
 
 
   It holds no keys, no payout address and no settings of your miner. A hash is only offered to the dashboard
-  after it passes a check against the share difficulty, so a wrong hash is never shown. If hashrelay is stopped,
+  after it passes a check against the share difficulty, so a wrong hash is never shown. If bitsrelay is stopped,
   a miner with a second pool entry falls back to it and keeps hashing.
 
 

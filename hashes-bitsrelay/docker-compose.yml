@@ -3,7 +3,7 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: hashes-hashrelay_web_1
+      APP_HOST: hashes-bitsrelay_web_1
       APP_PORT: 3000
       # the page (and the setting of the pool port) sits behind the Umbrel login; only the read-only list of
       # share hashes is open, so the hashes.space dashboard on your computer can read it
