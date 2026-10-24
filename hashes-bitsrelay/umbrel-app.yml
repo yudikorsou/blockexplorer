@@ -2,7 +2,7 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: bitsrelay
-version: "1.0.0"
+version: "1.1.0"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
 description: >-
@@ -10,6 +10,9 @@ description: >-
   It passes everything on unchanged, and works out the real BLAKE2b hash of every share the pool accepts, so
   the bits that fly into the block on the hashes.space dashboard are the real bits of your miner's work, not
   generated ones.
+
+
+  Every accepted share is kept on your Umbrel, and you can download your shares as Excel, PDF or CSV from the app page.
 
 
   It holds no keys, no payout address and no settings of your miner. A hash is only offered to the dashboard
@@ -36,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  First release: the relay on port 23340 with real share hashes for the hashes.space dashboard, and a page to set the pool port it forwards to.
+  Every accepted share is now kept on your Umbrel (with its real hash), and the app page has downloads of your shares as Excel, PDF or CSV, for everything or a range of days.

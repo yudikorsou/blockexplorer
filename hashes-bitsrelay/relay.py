@@ -13,6 +13,10 @@ only offered after it passes a check against the share difficulty, so a wrong ha
   GET  /api/status       what the relay sees (JSON)
   GET  /api/hashes?since=<seq>   the latest verified share hashes (read by the hashes.space dashboard; no login)
   POST /api/config       {"upstream_host": "...", "upstream_port": 23339}
+  GET  /api/export.xlsx|pdf|csv?from=YYYY-MM-DD&to=YYYY-MM-DD   every accepted share ever relayed, as a download (behind the login)
+
+Every accepted share is kept in /data/shares.db (SQLite): time, worker, miner address, difficulty and, when it passed
+the check, its real hash. It is never deleted by bitsrelay.
 
 The hash of a share on the Bitcoin BLAKE2b chain as a pooled miner computes it (header v2, "mode 0": the job's
 previous hash has its first 6 bytes zeroed), from Bitcoin Knots src/primitives/block.cpp, CBlockHeader::GetHash:
@@ -20,13 +24,17 @@ previous hash has its first 6 bytes zeroed), from Bitcoin Knots src/primitives/b
   stage 2 = BLAKE2b-256( prevhash(32) | nonce(8) | ntime(8) | stage 1 )
 """
 import asyncio
+import calendar
 import hashlib
 import html
 import json
 import math
 import os
 import re
+import sqlite3
+import tempfile
 import time
+import zipfile
 from collections import deque
 from urllib.parse import parse_qs, urlparse
 
@@ -50,6 +58,57 @@ seq = 0
 miners = {}                          # ip -> {since, checked, failed, last, worker, pool}
 events = deque(maxlen=30)            # what the status page lists
 totals = {'checked': 0, 'failed': 0}
+
+# ---------------------------------------------------------------- the record of every accepted share
+DB_FILE = os.path.join(DATA, 'shares.db')
+pending = []                         # rows waiting for the next write to disk
+stored = {'count': 0, 'first': None, 'verified': 0}
+db = None
+
+
+def db_connect():
+    c = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA synchronous=NORMAL')
+    return c
+
+
+def db_init():
+    global db
+    os.makedirs(DATA, exist_ok=True)
+    db = db_connect()
+    db.execute('CREATE TABLE IF NOT EXISTS shares (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, worker TEXT, ip TEXT, diff REAL, hash TEXT, verified INTEGER NOT NULL)')
+    db.execute('CREATE INDEX IF NOT EXISTS shares_t ON shares (t)')
+    db.commit()
+    n, first, ver = db.execute('SELECT COUNT(*), MIN(t), COALESCE(SUM(verified),0) FROM shares').fetchone()
+    stored.update({'count': n, 'first': first, 'verified': ver})
+
+
+def record(t_ms, worker, ip, diff, h):
+    pending.append((t_ms, worker, ip, diff, h, 1 if h else 0))
+    stored['count'] += 1
+    stored['verified'] += 1 if h else 0
+    if stored['first'] is None:
+        stored['first'] = t_ms
+
+
+def flush():
+    if not pending or db is None:
+        return
+    rows = pending[:]
+    del pending[:len(rows)]
+    try:
+        db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified) VALUES (?,?,?,?,?,?)', rows)
+        db.commit()
+    except Exception as e:
+        pending[:0] = rows      # try again next time; nothing is dropped
+        note(f'could not write the shares to disk ({e.__class__.__name__})')
+
+
+async def flusher():
+    while True:
+        await asyncio.sleep(1)
+        flush()
 
 
 def note(text):
@@ -86,12 +145,14 @@ async def relay(client_r, client_w):
         note(f"cannot reach the pool port {cfg['upstream_host']}:{cfg['upstream_port']} ({e.__class__.__name__})")
         client_w.close()
         return
-    st = {'en1': '', 'jobs': {}, 'diff': 1.0, 'pending': {}}
+    st = {'en1': '', 'jobs': {}, 'diff': 1.0, 'pending': {}, 'worker': ''}
     m = miners.setdefault(ip, {'since': time.time(), 'checked': 0, 'failed': 0, 'last': 0, 'worker': '', 'pool': f"{cfg['upstream_host']}:{cfg['upstream_port']}"}) if ip else None
 
     def on_miner(msg):
         if msg.get('method') == 'mining.authorize' and m is not None and msg.get('params'):
             m['worker'] = str(msg['params'][0])[:60]
+        if msg.get('method') == 'mining.authorize' and msg.get('params'):
+            st['worker'] = str(msg['params'][0])[:90]
         if msg.get('method') == 'mining.submit' and isinstance(msg.get('params'), list) and len(msg['params']) >= 5:
             job = st['jobs'].get(str(msg['params'][1]))
             h = None
@@ -117,22 +178,27 @@ async def relay(client_r, client_w):
                 st['jobs'].pop(next(iter(st['jobs'])))
         elif msg.get('id') in st['pending']:
             h, diff = st['pending'].pop(msg['id'])
-            if msg.get('result') is True and h:
-                # a share that meets difficulty D has about 32 + log2(D) leading zero bits; a wrong layout is nowhere near
-                need = 32 + math.floor(math.log2(max(1.0, diff))) - 3
-                bits = lz_bits(bytes.fromhex(h))
-                if bits >= need:
-                    seq += 1
-                    shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff})
-                    totals['checked'] += 1
-                    if m is not None:
-                        m['checked'] += 1
-                        m['last'] = time.time()
-                else:
-                    totals['failed'] += 1
-                    if m is not None:
-                        m['failed'] += 1
-                    note(f'a share hash failed the check ({bits} zero bits, {need} needed at difficulty {diff:g})')
+            if msg.get('result') is True:
+                good = None
+                if h:
+                    # a share that meets difficulty D has about 32 + log2(D) leading zero bits; a wrong layout is nowhere near
+                    need = 32 + math.floor(math.log2(max(1.0, diff))) - 3
+                    bits = lz_bits(bytes.fromhex(h))
+                    if bits >= need:
+                        good = h
+                        seq += 1
+                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff})
+                        totals['checked'] += 1
+                        if m is not None:
+                            m['checked'] += 1
+                            m['last'] = time.time()
+                    else:
+                        totals['failed'] += 1
+                        if m is not None:
+                            m['failed'] += 1
+                        note(f'a share hash failed the check ({bits} zero bits, {need} needed at difficulty {diff:g})')
+                # every accepted share is kept; its hash only when it passed the check
+                record(int(time.time() * 1000), st['worker'], ip, diff, good)
         elif isinstance(msg.get('result'), list) and len(msg['result']) >= 2 and isinstance(msg['result'][1], str) and msg.get('id') is not None:
             st['en1'] = msg['result'][1]   # the reply to mining.subscribe: [[subscriptions], extranonce1, extranonce2_size]
 
@@ -175,6 +241,257 @@ async def relay(client_r, client_w):
         m['since'] = m['since'] if time.time() - m['last'] < 120 else m['since']
 
 
+# ---------------------------------------------------------------- downloads: Excel, PDF, CSV
+def day_bounds(q):
+    """?from=YYYY-MM-DD&to=YYYY-MM-DD (UTC, both days included) as milliseconds"""
+    def one(name, end):
+        v = (q.get(name) or [''])[0]
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', v):
+            return None
+        t = calendar.timegm(time.strptime(v, '%Y-%m-%d'))
+        return int((t + (86400 if end else 0)) * 1000) - (1 if end else 0)
+    return one('from', False), one('to', True)
+
+
+def where(t0, t1):
+    cond, args = [], []
+    if t0 is not None:
+        cond.append('t >= ?')
+        args.append(t0)
+    if t1 is not None:
+        cond.append('t <= ?')
+        args.append(t1)
+    return (' WHERE ' + ' AND '.join(cond)) if cond else '', args
+
+
+def utc(t_ms, fmt='%Y-%m-%d %H:%M:%S'):
+    return time.strftime(fmt, time.gmtime(t_ms / 1000))
+
+
+def summary(con, t0, t1):
+    w, a = where(t0, t1)
+    n, ver, work, first, last = con.execute(f'SELECT COUNT(*), COALESCE(SUM(verified),0), COALESCE(SUM(diff),0), MIN(t), MAX(t) FROM shares{w}', a).fetchone()
+    workers = con.execute(f"SELECT COALESCE(NULLIF(worker,''),'(unknown)'), COUNT(*), SUM(verified), SUM(diff), MIN(t), MAX(t) FROM shares{w} GROUP BY 1 ORDER BY 2 DESC", a).fetchall()
+    days = con.execute(f"SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch') d, COUNT(*), SUM(verified), SUM(diff) FROM shares{w} GROUP BY d ORDER BY d", a).fetchall()
+    best = con.execute(f"SELECT hash, t, COALESCE(NULLIF(worker,''),'(unknown)'), diff FROM shares{w}{' AND' if w else ' WHERE'} hash IS NOT NULL ORDER BY hash ASC LIMIT 10", a).fetchall()
+    return {'n': n, 'ver': ver, 'work': work, 'first': first, 'last': last, 'workers': workers, 'days': days, 'best': best}
+
+
+def period_text(t0, t1, s):
+    if s['first'] is None:
+        return 'no shares in this period'
+    return f"{utc(s['first'])} to {utc(s['last'])} UTC"
+
+
+# --- CSV
+def build_csv(path, t0, t1):
+    con = db_connect()
+    w, a = where(t0, t1)
+    with open(path, 'w', newline='') as f:
+        f.write('number,time_utc,worker,miner_address,difficulty,hash,zero_bits,hash_verified\r\n')
+        for i, (t, wk, ip, d, h, v) in enumerate(con.execute(f'SELECT t, worker, ip, diff, hash, verified FROM shares{w} ORDER BY id', a), 1):
+            f.write(f'{i},{utc(t)},"{(wk or "").replace(chr(34), "")}",{ip or ""},{d:g},{h or ""},{lz_bits(bytes.fromhex(h)) if h else ""},{"yes" if v else "no"}\r\n')
+    con.close()
+
+
+# --- Excel (.xlsx written by hand: it is a zip of small XML files)
+def xesc(t):
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', html.escape(str(t), quote=False))
+
+
+def col(n):
+    s = ''
+    while True:
+        n, r = divmod(n, 26)
+        s = chr(65 + r) + s
+        if n == 0:
+            return s
+        n -= 1
+
+
+def xrow(r, cells):
+    out = [f'<row r="{r}">']
+    for c, v in enumerate(cells):
+        if v is None or v == '':
+            continue
+        ref = f'{col(c)}{r}'
+        if isinstance(v, tuple):          # (kind, value): 'b' bold text, 'd' date-time
+            kind, val = v
+            if kind == 'd':
+                out.append(f'<c r="{ref}" s="2"><v>{val / 86400000 + 25569:.8f}</v></c>')
+            else:
+                out.append(f'<c r="{ref}" s="1" t="inlineStr"><is><t>{xesc(val)}</t></is></c>')
+        elif isinstance(v, (int, float)):
+            out.append(f'<c r="{ref}"><v>{v!r}</v></c>')
+        else:
+            out.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{xesc(v)}</t></is></c>')
+    out.append('</row>')
+    return ''.join(out)
+
+
+SHEET_OPEN = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+MAX_ROWS = 1_000_000                   # a sheet holds 1,048,576 rows; the next sheet takes over after this many
+
+
+def build_xlsx(path, t0, t1):
+    con = db_connect()
+    s = summary(con, t0, t1)
+    w, a = where(t0, t1)
+    names = ['Summary']
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        # Summary sheet
+        r = 1
+        rows = [[('b', 'bitsrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
+                [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Total difficulty (work)'), s['work']], [],
+                [('b', 'Per worker')], [('b', 'Worker'), ('b', 'Shares'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'First share'), ('b', 'Last share')]]
+        for wk, n, v, d, f, l in s['workers']:
+            rows.append([wk, n, v or 0, d or 0, ('d', f), ('d', l)])
+        rows += [[], [('b', 'Per day (UTC)')], [('b', 'Day'), ('b', 'Shares'), ('b', 'Verified hashes'), ('b', 'Total difficulty')]]
+        for d, n, v, df in s['days']:
+            rows.append([d, n, v or 0, df or 0])
+        rows += [[], [('b', 'Best 10 hashes (most leading zeros)')], [('b', 'Hash'), ('b', 'Time (UTC)'), ('b', 'Worker'), ('b', 'Difficulty')]]
+        for h, t, wk, d in s['best']:
+            rows.append([h, ('d', t), wk, d])
+        with z.open('xl/worksheets/sheet1.xml', 'w') as f:
+            f.write((SHEET_OPEN + '<cols><col min="1" max="1" width="30" customWidth="1"/><col min="2" max="6" width="22" customWidth="1"/></cols><sheetData>').encode())
+            for i, row in enumerate(rows, 1):
+                f.write(xrow(i, row).encode())
+            f.write(b'</sheetData></worksheet>')
+        # the shares: every one, in as many sheets as it takes
+        head = [('b', x) for x in ('#', 'Time (UTC)', 'Worker', 'Miner address', 'Difficulty', 'Hash', 'Zero bits', 'Hash verified')]
+        cur = con.execute(f'SELECT t, worker, ip, diff, hash, verified FROM shares{w} ORDER BY id', a)
+        k, sheet, f, r = 0, 1, None, 0
+        for k, (t, wk, ip, d, h, v) in enumerate(cur, 1):
+            if f is None or r > MAX_ROWS:
+                if f is not None:
+                    f.write(b'</sheetData></worksheet>')
+                    f.close()
+                sheet += 1
+                names.append(f'Shares {sheet - 1}')
+                f = z.open(f'xl/worksheets/sheet{sheet}.xml', 'w')
+                f.write((SHEET_OPEN + '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                         '<cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/><col min="3" max="4" width="24" customWidth="1"/><col min="5" max="5" width="12" customWidth="1"/><col min="6" max="6" width="68" customWidth="1"/></cols><sheetData>').encode())
+                f.write(xrow(1, head).encode())
+                r = 1
+            r += 1
+            f.write(xrow(r, [k, ('d', t), wk or '', ip or '', d, h or '', lz_bits(bytes.fromhex(h)) if h else '', 'yes' if v else 'no']).encode())
+        if f is not None:
+            f.write(b'</sheetData></worksheet>')
+            f.close()
+        if len(names) == 1:
+            names.append('Shares 1')
+            z.writestr('xl/worksheets/sheet2.xml', SHEET_OPEN + '<sheetData>' + xrow(1, head) + '</sheetData></worksheet>')
+        n = len(names)
+        z.writestr('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                   + ''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, n + 1)) + '</Types>')
+        z.writestr('_rels/.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        z.writestr('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+                   + ''.join(f'<sheet name="{nm}" sheetId="{i}" r:id="rId{i}"/>' for i, nm in enumerate(names, 1)) + '</sheets></workbook>')
+        z.writestr('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   + ''.join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, n + 1))
+                   + f'<Relationship Id="rId{n + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        z.writestr('xl/styles.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy\\-mm\\-dd\\ hh:mm:ss"/></numFmts>'
+                   '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+                   '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+                   '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+    con.close()
+
+
+# --- PDF (a plain, text-only PDF written by hand: the totals, not every hash; the Excel file has every hash)
+class Pdf:
+    W, H, M = 595, 842, 48
+
+    def __init__(self):
+        self.pages = []
+        self.y = 0
+        self.newpage()
+
+    def newpage(self):
+        self.pages.append([])
+        self.y = self.H - self.M
+
+    def text(self, x, s, font='F1', size=10, lead=None):
+        s = str(s).encode('latin-1', 'replace').decode('latin-1').replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+        self.pages[-1].append(f'BT /{font} {size} Tf {x} {self.y:.1f} Td ({s}) Tj ET')
+
+    def line(self, cols, xs, font='F1', size=10):
+        if self.y < self.M + 20:
+            self.newpage()
+        for x, c in zip(xs, cols):
+            self.text(x, c, font, size)
+        self.y -= size + 5
+
+    def gap(self, n=8):
+        self.y -= n
+
+    def save(self, path):
+        objs = []
+        pages = len(self.pages)
+        objs.append('<< /Type /Catalog /Pages 2 0 R >>')
+        objs.append('<< /Type /Pages /Kids [' + ' '.join(f'{6 + 2 * i} 0 R' for i in range(pages)) + f'] /Count {pages} >>')
+        for font in ('Helvetica', 'Helvetica-Bold', 'Courier'):
+            objs.append(f'<< /Type /Font /Subtype /Type1 /BaseFont /{font} /Encoding /WinAnsiEncoding >>')
+        objs.append(None)   # placeholder to keep the numbering: object 6 is the first page
+        objs.pop()
+        for i, items in enumerate(self.pages):
+            foot = f'BT /F1 8 Tf {self.M} 24 Td (bitsrelay  -  page {i + 1} of {pages}) Tj ET'
+            stream = '\n'.join(items + [foot])
+            objs.append(f'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {self.W} {self.H}] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents {7 + 2 * i} 0 R >>')
+            objs.append(f'<< /Length {len(stream.encode("latin-1", "replace"))} >>\nstream\n{stream}\nendstream')
+        out = bytearray(b'%PDF-1.4\n')
+        offs = []
+        for i, o in enumerate(objs, 1):
+            offs.append(len(out))
+            out += f'{i} 0 obj\n{o}\nendobj\n'.encode('latin-1', 'replace')
+        x = len(out)
+        out += f'xref\n0 {len(objs) + 1}\n0000000000 65535 f \n'.encode()
+        for o in offs:
+            out += f'{o:010d} 00000 n \n'.encode()
+        out += f'trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n'.encode()
+        with open(path, 'wb') as f:
+            f.write(out)
+
+
+def build_pdf(path, t0, t1):
+    con = db_connect()
+    s = summary(con, t0, t1)
+    con.close()
+    p = Pdf()
+    M = p.M
+    p.text(M, 'bitsrelay: shares relayed', 'F2', 20)
+    p.y -= 26
+    p.line([f'Period: {period_text(t0, t1, s)}'], [M])
+    p.line([f"Generated: {utc(time.time() * 1000)} UTC. Days are UTC days."], [M])
+    p.gap(10)
+    p.line(['Accepted shares'], [M], 'F2', 11)
+    p.line(['Total', f"{s['n']:,}"], [M, 230], 'F2', 14)
+    p.line(['With a verified real hash', f"{s['ver']:,}"], [M, 230])
+    p.line(['Total difficulty (work)', f"{s['work']:,.0f}"], [M, 230])
+    p.gap(12)
+    p.line(['Per worker'], [M], 'F2', 11)
+    xs = [M, 215, 285, 365, 470]
+    p.line(['Worker', 'Shares', 'Verified', 'Total difficulty', 'Last share'], xs, 'F2', 9)
+    for wk, n, v, d, f, l in s['workers']:
+        p.line([wk[:24], f'{n:,}', f'{(v or 0):,}', f'{(d or 0):,.0f}', utc(l, '%Y-%m-%d %H:%M')], xs, 'F1', 9)
+    p.gap(12)
+    p.line(['Per day (UTC)'], [M], 'F2', 11)
+    xs = [M, 150, 240, 330]
+    p.line(['Day', 'Shares', 'Verified', 'Total difficulty'], xs, 'F2', 9)
+    for d, n, v, df in s['days']:
+        p.line([d, f'{n:,}', f'{(v or 0):,}', f'{(df or 0):,.0f}'], xs, 'F1', 9)
+    p.gap(12)
+    p.line(['Best 10 hashes (most leading zeros)'], [M], 'F2', 11)
+    for h, t, wk, d in s['best']:
+        p.line([h], [M], 'F3', 8)
+        p.line([f'{utc(t)} UTC, {wk[:30]}, difficulty {d:g}'], [M + 10], 'F1', 8)
+    p.gap(10)
+    p.line(['Every share with its hash is in the Excel and CSV downloads.'], [M], 'F1', 9)
+    p.save(path)
+
+
+BUILDERS = {'xlsx': (build_xlsx, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'), 'pdf': (build_pdf, 'application/pdf'), 'csv': (build_csv, 'text/csv; charset=utf-8')}
+
+
 # ---------------------------------------------------------------- web page and API
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>bitsrelay</title><style>
@@ -188,6 +505,7 @@ main{max-width:760px;margin:0 auto;padding:28px 16px;display:grid;gap:16px}h1{ma
 code,.mono{font-family:ui-monospace,monospace;font-size:13px;word-break:break-all}
 input{font:inherit;padding:8px 10px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--text);min-width:0}
 button{font:inherit;font-weight:600;padding:8px 14px;border-radius:6px;border:0;background:var(--link);color:#001;cursor:pointer}
+a.btn{font-weight:600;padding:8px 14px;border-radius:6px;background:var(--link);color:#001;text-decoration:none}label input{margin-left:4px}
 form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-left:18px}li{margin:3px 0}.ok{color:var(--ok)}.bad{color:var(--bad)}
 </style></head><body><main>
 <h1>bitsrelay</h1>
@@ -199,6 +517,11 @@ form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-
 <div class="card"><h2>Pool port to forward to</h2>
 <form id="f"><input id="h" aria-label="Pool host" value="__HOST__" size="26"><input id="p" aria-label="Pool port" value="__UPPORT__" size="7" inputmode="numeric"><button>Save</button><span id="msg" class="muted"></span></form>
 <p class="muted">The stratum address of the pool your miner hashes on now, for example DATUM Gateway on this Umbrel. <code>host.docker.internal</code> is this Umbrel itself.</p></div>
+<div class="card"><h2>Your shares</h2>
+<p class="muted" id="st">Every share the pool accepts is kept on this Umbrel, with its real hash when it passed the check. Nothing is sent anywhere.</p>
+<form id="dl"><label class="muted">From <input type="date" id="df"></label><label class="muted">To <input type="date" id="dt"></label>
+<a class="btn" id="x" href="#">Excel</a><a class="btn" id="d" href="#">PDF</a><a class="btn" id="c" href="#">CSV</a></form>
+<p class="muted">Leave the dates empty for everything. Days are UTC days. The PDF holds the totals (per worker, per day, best hashes); Excel and CSV hold every share with its hash.</p></div>
 <div class="card"><h2>Miners</h2><ul id="ml"><li class="muted">none yet</li></ul></div>
 <div class="card"><h2>Latest events</h2><ul id="ev" class="mono"></ul></div>
 <script>
@@ -206,10 +529,14 @@ const $=id=>document.getElementById(id);
 async function load(){try{const s=await (await fetch('api/status')).json();
 $('miners').textContent=s.miners.length;$('checked').textContent=s.checked;$('failed').textContent=s.failed;$('failed').className=s.failed?'bad':'';
 $('ml').innerHTML=s.miners.map(m=>'<li><span class="mono">'+esc(m.ip)+'</span> '+esc(m.worker)+' · '+m.checked+' real hashes'+(m.last?' · last '+Math.round(Date.now()/1000-m.last)+' s ago':'')+'</li>').join('')||'<li class="muted">none yet</li>';
+$('st').textContent=s.stored.toLocaleString()+' accepted shares kept ('+s.storedVerified.toLocaleString()+' with a verified real hash)'+(s.storedSince?', since '+new Date(s.storedSince).toLocaleDateString():'')+'. Nothing is sent anywhere.';
 $('ev').innerHTML=s.events.map(e=>'<li>'+new Date(e.t*1000).toLocaleTimeString()+' '+esc(e.text)+'</li>').join('');}catch(e){}}
 function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 $('f').onsubmit=async e=>{e.preventDefault();const r=await fetch('api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({upstream_host:$('h').value.trim(),upstream_port:Number($('p').value)})});
 const j=await r.json();$('msg').textContent=r.ok?'Saved. New connections use it.':(j.error||'Not saved');};
+function links(){const q=(($('df').value?'from='+$('df').value:'')+($('dt').value?'&to='+$('dt').value:'')).replace(/^&/,'');
+for(const [id,k] of [['x','xlsx'],['d','pdf'],['c','csv']])$(id).href='api/export.'+k+(q?'?'+q:'');}
+$('df').onchange=$('dt').onchange=links;links();
 load();setInterval(load,2000);
 </script></main></body></html>"""
 
@@ -241,11 +568,37 @@ async def web(r, w):
             status, ctype, out = json_resp({
                 'upstream': f"{cfg['upstream_host']}:{cfg['upstream_port']}", 'stratumPort': STRATUM_PORT,
                 'checked': totals['checked'], 'failed': totals['failed'],
+                'stored': stored['count'], 'storedVerified': stored['verified'], 'storedSince': stored['first'],
                 'miners': [{'ip': ip, **{k: v for k, v in mm.items() if k in ('worker', 'checked', 'failed', 'last')}} for ip, mm in miners.items()],
                 'events': list(events)})
         elif method == 'GET' and u.path == '/api/hashes':
             since = int((parse_qs(u.query).get('since') or ['0'])[0] or 0)
             status, ctype, out = json_resp({'stratumPort': STRATUM_PORT, 'seq': seq, 'shares': [s for s in shares if s['seq'] > since]})
+        elif method == 'GET' and re.fullmatch(r'/api/export\.(xlsx|pdf|csv)', u.path):
+            kind = u.path.rsplit('.', 1)[1]
+            fn, ctype = BUILDERS[kind]
+            t0, t1 = day_bounds(parse_qs(u.query))
+            flush()
+            tmp = tempfile.NamedTemporaryFile(dir=tempfile.gettempdir(), suffix='.' + kind, delete=False)
+            tmp.close()
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, fn, tmp.name, t0, t1)
+                size = os.path.getsize(tmp.name)
+                name = f"bitsrelay-shares-{time.strftime('%Y-%m-%d', time.gmtime())}.{kind}"
+                w.write(f'HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {size}\r\nContent-Disposition: attachment; filename="{name}"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n'.encode())
+                with open(tmp.name, 'rb') as fh:
+                    while True:
+                        chunk = fh.read(1 << 20)
+                        if not chunk:
+                            break
+                        w.write(chunk)
+                        await w.drain()
+                return
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
         elif method == 'POST' and u.path == '/api/config':
             try:
                 b = json.loads(body or b'{}')
@@ -277,7 +630,8 @@ async def web(r, w):
 
 
 async def main():
-    os.makedirs(DATA, exist_ok=True)
+    db_init()
+    asyncio.ensure_future(flusher())
     await asyncio.start_server(relay, '0.0.0.0', STRATUM_PORT)
     await asyncio.start_server(web, '0.0.0.0', WEB_PORT)
     note(f"bitsrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
