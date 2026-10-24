@@ -57,13 +57,13 @@ shares = deque(maxlen=1000)          # verified shares: {seq, t, ip, hash, diff}
 seq = 0
 miners = {}                          # ip -> {since, checked, failed, last, worker, pool}
 events = deque(maxlen=30)            # what the status page lists
-totals = {'checked': 0, 'failed': 0}
+totals = {'checked': 0, 'failed': 0, 'rejected': 0, 'stale': 0}
 latest = {'prev': None, 't': 0}      # the previous-block hash of the newest job the pool sent: the block being hashed now
 
 # ---------------------------------------------------------------- the record of every accepted share
 DB_FILE = os.path.join(DATA, 'shares.db')
 pending = []                         # rows waiting for the next write to disk
-stored = {'count': 0, 'first': None, 'verified': 0}
+stored = {'count': 0, 'first': None, 'verified': 0, 'rejected': 0, 'stale': 0}
 db = None
 
 
@@ -83,16 +83,25 @@ def db_init():
     cols = [r[1] for r in db.execute('PRAGMA table_info(shares)')]
     if 'prev' not in cols:       # the block a share belongs to: the previous-block hash of the job it was made on
         db.execute('ALTER TABLE shares ADD COLUMN prev TEXT')
+    if 'status' not in cols:     # accepted | rejected | stale (the pool's answer to the share)
+        db.execute("ALTER TABLE shares ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'")
+    if 'reason' not in cols:     # what the pool said about a share it did not accept
+        db.execute('ALTER TABLE shares ADD COLUMN reason TEXT')
     db.execute('CREATE INDEX IF NOT EXISTS shares_prev ON shares (prev)')
     db.commit()
-    n, first, ver = db.execute('SELECT COUNT(*), MIN(t), COALESCE(SUM(verified),0) FROM shares').fetchone()
-    stored.update({'count': n, 'first': first, 'verified': ver})
+    n, first, ver, rej, stale = db.execute("SELECT COALESCE(SUM(status='accepted'),0), MIN(t), COALESCE(SUM(verified),0), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares").fetchone()
+    stored.update({'count': n, 'first': first, 'verified': ver, 'rejected': rej, 'stale': stale})
 
 
-def record(t_ms, worker, ip, diff, h, prev=None):
-    pending.append((t_ms, worker, ip, diff, h, 1 if h else 0, prev))
-    stored['count'] += 1
-    stored['verified'] += 1 if h else 0
+def record(t_ms, worker, ip, diff, h, prev=None, status='accepted', reason=None):
+    """one share and the pool's answer to it. h: its hash when it passed the check (an accepted share), or the hash as computed for a share the pool did not accept"""
+    ok = status == 'accepted' and bool(h)
+    pending.append((t_ms, worker, ip, diff, h, 1 if ok else 0, prev, status, (reason or '')[:160] or None))
+    if status == 'accepted':
+        stored['count'] += 1
+        stored['verified'] += 1 if ok else 0
+    elif status in stored:
+        stored[status] += 1
     if stored['first'] is None:
         stored['first'] = t_ms
 
@@ -103,7 +112,7 @@ def flush():
     rows = pending[:]
     del pending[:len(rows)]
     try:
-        db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified, prev) VALUES (?,?,?,?,?,?,?)', rows)
+        db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified, prev, status, reason) VALUES (?,?,?,?,?,?,?,?,?)', rows)
         db.commit()
     except Exception as e:
         pending[:0] = rows      # try again next time; nothing is dropped
@@ -119,6 +128,20 @@ async def flusher():
 def note(text):
     events.appendleft({'t': time.time(), 'text': text})
     print(time.strftime('%H:%M:%S'), text, flush=True)
+
+
+def error_text(err):
+    """the pool's words for a share it did not accept: [code, "message", data], {"message": ...} or a plain string"""
+    try:
+        if isinstance(err, list) and len(err) >= 2:
+            return f'{err[1]} (code {err[0]})'[:160]
+        if isinstance(err, dict):
+            return str(err.get('message') or err)[:160]
+        if err:
+            return str(err)[:160]
+    except Exception:
+        pass
+    return 'rejected by the pool'
 
 
 def lz_bits(b):
@@ -151,7 +174,7 @@ async def relay(client_r, client_w):
         client_w.close()
         return
     st = {'en1': '', 'jobs': {}, 'diff': 1.0, 'pending': {}, 'worker': ''}
-    m = miners.setdefault(ip, {'since': time.time(), 'checked': 0, 'failed': 0, 'last': 0, 'worker': '', 'pool': f"{cfg['upstream_host']}:{cfg['upstream_port']}"}) if ip else None
+    m = miners.setdefault(ip, {'since': time.time(), 'checked': 0, 'failed': 0, 'rejected': 0, 'stale': 0, 'last': 0, 'worker': '', 'pool': f"{cfg['upstream_host']}:{cfg['upstream_port']}"}) if ip else None
 
     def on_miner(msg):
         if msg.get('method') == 'mining.authorize' and m is not None and msg.get('params'):
@@ -205,6 +228,15 @@ async def relay(client_r, client_w):
                         note(f'a share hash failed the check ({bits} zero bits, {need} needed at difficulty {diff:g})')
                 # every accepted share is kept; its hash only when it passed the check
                 record(int(time.time() * 1000), st['worker'], ip, diff, good, jprev)
+            else:
+                # the pool did not accept it: kept too, with what the pool said (a stale share is one for a job that is no longer current)
+                reason = error_text(msg.get('error'))
+                kind = 'stale' if re.search(r'stale|job not found|unknown job|expired|old job|no such job', reason, re.I) else 'rejected'
+                record(int(time.time() * 1000), st['worker'], ip, diff, h, jprev, kind, reason)
+                totals[kind] = totals.get(kind, 0) + 1
+                if m is not None:
+                    m[kind] = m.get(kind, 0) + 1
+                note(f'a share was {kind}: {reason}')
         elif isinstance(msg.get('result'), list) and len(msg['result']) >= 2 and isinstance(msg['result'][1], str) and msg.get('id') is not None:
             st['en1'] = msg['result'][1]   # the reply to mining.subscribe: [[subscriptions], extranonce1, extranonce2_size]
 
@@ -284,11 +316,12 @@ def wsql(anon):
 
 def summary(con, t0, t1, prev=None, anon=False):
     w, a = where(t0, t1, prev)
-    n, ver, work, first, last = con.execute(f'SELECT COUNT(*), COALESCE(SUM(verified),0), COALESCE(SUM(diff),0), MIN(t), MAX(t) FROM shares{w}', a).fetchone()
-    workers = con.execute(f"SELECT {wsql(anon)}, COUNT(*), SUM(verified), SUM(diff), MIN(t), MAX(t) FROM shares{w} GROUP BY 1 ORDER BY 2 DESC", a).fetchall()
-    days = con.execute(f"SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch') d, COUNT(*), SUM(verified), SUM(diff) FROM shares{w} GROUP BY d ORDER BY d", a).fetchall()
-    best = con.execute(f"SELECT hash, t, {wsql(anon)}, diff FROM shares{w}{' AND' if w else ' WHERE'} hash IS NOT NULL ORDER BY hash ASC LIMIT 10", a).fetchall()
-    return {'n': n, 'ver': ver, 'work': work, 'first': first, 'last': last, 'workers': workers, 'days': days, 'best': best}
+    wa = (w + ' AND' if w else ' WHERE') + " status='accepted'"
+    n, ver, work, rej, stale, first, last = con.execute(f"SELECT COALESCE(SUM(status='accepted'),0), COALESCE(SUM(verified),0), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0), MIN(t), MAX(t) FROM shares{w}", a).fetchone()
+    workers = con.execute(f"SELECT {wsql(anon)}, SUM(status='accepted'), SUM(verified), SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END), SUM(status='rejected'), SUM(status='stale'), MIN(t), MAX(t) FROM shares{w} GROUP BY 1 ORDER BY 2 DESC", a).fetchall()
+    days = con.execute(f"SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch') d, SUM(status='accepted'), SUM(verified), SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END), SUM(status!='accepted') FROM shares{w} GROUP BY d ORDER BY d", a).fetchall()
+    best = con.execute(f"SELECT hash, t, {wsql(anon)}, diff FROM shares{wa} AND hash IS NOT NULL ORDER BY hash ASC LIMIT 10", a).fetchall()
+    return {'n': n, 'ver': ver, 'work': work, 'rej': rej, 'stale': stale, 'first': first, 'last': last, 'workers': workers, 'days': days, 'best': best}
 
 
 def period_text(t0, t1, s):
@@ -302,9 +335,9 @@ def build_csv(path, t0, t1, prev=None, label=None, anon=False):
     con = db_connect()
     w, a = where(t0, t1, prev)
     with open(path, 'w', newline='') as f:
-        f.write('number,time_utc,worker,miner_address,difficulty,hash,zero_bits,hash_verified\r\n')
-        for i, (t, wk, ip, d, h, v) in enumerate(con.execute(f"SELECT t, {wsql(anon)}, {'NULL' if anon else 'ip'}, diff, hash, verified FROM shares{w} ORDER BY id", a), 1):
-            f.write(f'{i},{utc(t)},"{(wk or "").replace(chr(34), "")}",{ip or ""},{d:g},{h or ""},{lz_bits(bytes.fromhex(h)) if h else ""},{"yes" if v else "no"}\r\n')
+        f.write('number,time_utc,worker,miner_address,difficulty,hash,zero_bits,hash_verified,status,reason\r\n')
+        for i, (t, wk, ip, d, h, v, st_, rs) in enumerate(con.execute(f"SELECT t, {wsql(anon)}, {'NULL' if anon else 'ip'}, diff, hash, verified, status, reason FROM shares{w} ORDER BY id", a), 1):
+            f.write(f'{i},{utc(t)},"{(wk or "").replace(chr(34), "")}",{ip or ""},{d:g},{h or ""},{lz_bits(bytes.fromhex(h)) if h else ""},{"yes" if v else "no"},{st_},"{(rs or "").replace(chr(34), "")}"\r\n')
     con.close()
 
 
@@ -356,26 +389,26 @@ def build_xlsx(path, t0, t1, prev=None, label=None, anon=False):
         # Summary sheet
         r = 1
         rows = [[('b', label or 'bitsrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
-                [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Total difficulty (work)'), s['work']], [],
-                [('b', 'Per worker')], [('b', 'Worker'), ('b', 'Shares'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'First share'), ('b', 'Last share')]]
-        for wk, n, v, d, f, l in s['workers']:
-            rows.append([wk, n, v or 0, d or 0, ('d', f), ('d', l)])
-        rows += [[], [('b', 'Per day (UTC)')], [('b', 'Day'), ('b', 'Shares'), ('b', 'Verified hashes'), ('b', 'Total difficulty')]]
-        for d, n, v, df in s['days']:
-            rows.append([d, n, v or 0, df or 0])
+                [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Rejected shares'), s['rej']], [('b', 'Stale shares'), s['stale']], [('b', 'Total difficulty (work)'), s['work']], [],
+                [('b', 'Per worker')], [('b', 'Worker'), ('b', 'Accepted'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'Rejected'), ('b', 'Stale'), ('b', 'First share'), ('b', 'Last share')]]
+        for wk, n, v, d, rj, stl, f, l in s['workers']:
+            rows.append([wk, n or 0, v or 0, d or 0, rj or 0, stl or 0, ('d', f), ('d', l)])
+        rows += [[], [('b', 'Per day (UTC)')], [('b', 'Day'), ('b', 'Accepted'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'Rejected or stale')]]
+        for d, n, v, df, rj in s['days']:
+            rows.append([d, n or 0, v or 0, df or 0, rj or 0])
         rows += [[], [('b', 'Best 10 hashes (most leading zeros)')], [('b', 'Hash'), ('b', 'Time (UTC)'), ('b', 'Worker'), ('b', 'Difficulty')]]
         for h, t, wk, d in s['best']:
             rows.append([h, ('d', t), wk, d])
         with z.open('xl/worksheets/sheet1.xml', 'w') as f:
-            f.write((SHEET_OPEN + '<cols><col min="1" max="1" width="30" customWidth="1"/><col min="2" max="6" width="22" customWidth="1"/></cols><sheetData>').encode())
+            f.write((SHEET_OPEN + '<cols><col min="1" max="1" width="30" customWidth="1"/><col min="2" max="8" width="20" customWidth="1"/></cols><sheetData>').encode())
             for i, row in enumerate(rows, 1):
                 f.write(xrow(i, row).encode())
             f.write(b'</sheetData></worksheet>')
         # the shares: every one, in as many sheets as it takes
-        head = [('b', x) for x in ('#', 'Time (UTC)', 'Worker', 'Miner address', 'Difficulty', 'Hash', 'Zero bits', 'Hash verified')]
-        cur = con.execute(f"SELECT t, {wsql(anon)}, {'NULL' if anon else 'ip'}, diff, hash, verified FROM shares{w} ORDER BY id", a)
+        head = [('b', x) for x in ('#', 'Time (UTC)', 'Worker', 'Miner address', 'Difficulty', 'Hash', 'Zero bits', 'Hash verified', 'Status', 'Reason')]
+        cur = con.execute(f"SELECT t, {wsql(anon)}, {'NULL' if anon else 'ip'}, diff, hash, verified, status, reason FROM shares{w} ORDER BY id", a)
         k, sheet, f, r = 0, 1, None, 0
-        for k, (t, wk, ip, d, h, v) in enumerate(cur, 1):
+        for k, (t, wk, ip, d, h, v, st_, rs) in enumerate(cur, 1):
             if f is None or r > MAX_ROWS:
                 if f is not None:
                     f.write(b'</sheetData></worksheet>')
@@ -384,11 +417,11 @@ def build_xlsx(path, t0, t1, prev=None, label=None, anon=False):
                 names.append(f'Shares {sheet - 1}')
                 f = z.open(f'xl/worksheets/sheet{sheet}.xml', 'w')
                 f.write((SHEET_OPEN + '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
-                         '<cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/><col min="3" max="4" width="24" customWidth="1"/><col min="5" max="5" width="12" customWidth="1"/><col min="6" max="6" width="68" customWidth="1"/></cols><sheetData>').encode())
+                         '<cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/><col min="3" max="4" width="24" customWidth="1"/><col min="5" max="5" width="12" customWidth="1"/><col min="6" max="6" width="68" customWidth="1"/><col min="7" max="8" width="12" customWidth="1"/><col min="9" max="9" width="12" customWidth="1"/><col min="10" max="10" width="40" customWidth="1"/></cols><sheetData>').encode())
                 f.write(xrow(1, head).encode())
                 r = 1
             r += 1
-            f.write(xrow(r, [k, ('d', t), wk or '', ip or '', d, h or '', lz_bits(bytes.fromhex(h)) if h else '', 'yes' if v else 'no']).encode())
+            f.write(xrow(r, [k, ('d', t), wk or '', ip or '', d, h or '', lz_bits(bytes.fromhex(h)) if h else '', 'yes' if v else 'no', st_, rs or '']).encode())
         if f is not None:
             f.write(b'</sheetData></worksheet>')
             f.close()
@@ -480,19 +513,21 @@ def build_pdf(path, t0, t1, prev=None, label=None, anon=False):
     p.line(['Accepted shares'], [M], 'F2', 11)
     p.line(['Total', f"{s['n']:,}"], [M, 230], 'F2', 14)
     p.line(['With a verified real hash', f"{s['ver']:,}"], [M, 230])
+    p.line(['Rejected shares', f"{s['rej']:,}"], [M, 230])
+    p.line(['Stale shares', f"{s['stale']:,}"], [M, 230])
     p.line(['Total difficulty (work)', f"{s['work']:,.0f}"], [M, 230])
     p.gap(12)
     p.line(['Per worker'], [M], 'F2', 11)
-    xs = [M, 215, 285, 365, 470]
-    p.line(['Worker', 'Shares', 'Verified', 'Total difficulty', 'Last share'], xs, 'F2', 9)
-    for wk, n, v, d, f, l in s['workers']:
-        p.line([wk[:24], f'{n:,}', f'{(v or 0):,}', f'{(d or 0):,.0f}', utc(l, '%Y-%m-%d %H:%M')], xs, 'F1', 9)
+    xs = [M, 190, 245, 300, 375, 420, 480]
+    p.line(['Worker', 'Accepted', 'Verified', 'Total difficulty', 'Rejected', 'Stale', 'Last share'], xs, 'F2', 8)
+    for wk, n, v, d, rj, stl, f, l in s['workers']:
+        p.line([wk[:22], f'{(n or 0):,}', f'{(v or 0):,}', f'{(d or 0):,.0f}', f'{(rj or 0):,}', f'{(stl or 0):,}', utc(l, '%m-%d %H:%M')], xs, 'F1', 8)
     p.gap(12)
     p.line(['Per day (UTC)'], [M], 'F2', 11)
-    xs = [M, 150, 240, 330]
-    p.line(['Day', 'Shares', 'Verified', 'Total difficulty'], xs, 'F2', 9)
-    for d, n, v, df in s['days']:
-        p.line([d, f'{n:,}', f'{(v or 0):,}', f'{(df or 0):,.0f}'], xs, 'F1', 9)
+    xs = [M, 150, 230, 310, 420]
+    p.line(['Day', 'Accepted', 'Verified', 'Total difficulty', 'Rejected or stale'], xs, 'F2', 9)
+    for d, n, v, df, rj in s['days']:
+        p.line([d, f'{(n or 0):,}', f'{(v or 0):,}', f'{(df or 0):,.0f}', f'{(rj or 0):,}'], xs, 'F1', 9)
     p.gap(12)
     p.line(['Best 10 hashes (most leading zeros)'], [M], 'F2', 11)
     for h, t, wk, d in s['best']:
@@ -543,7 +578,7 @@ const $=id=>document.getElementById(id);
 async function load(){try{const s=await (await fetch('api/status')).json();
 $('miners').textContent=s.miners.length;$('checked').textContent=s.checked;$('failed').textContent=s.failed;$('failed').className=s.failed?'bad':'';
 $('ml').innerHTML=s.miners.map(m=>'<li><span class="mono">'+esc(m.ip)+'</span> '+esc(m.worker)+' · '+m.checked+' real hashes'+(m.last?' · last '+Math.round(Date.now()/1000-m.last)+' s ago':'')+'</li>').join('')||'<li class="muted">none yet</li>';
-$('st').textContent=s.stored.toLocaleString()+' accepted shares kept ('+s.storedVerified.toLocaleString()+' with a verified real hash)'+(s.storedSince?', since '+new Date(s.storedSince).toLocaleDateString():'')+'. Nothing is sent anywhere.';
+$('st').textContent=s.stored.toLocaleString()+' accepted shares kept ('+s.storedVerified.toLocaleString()+' with a verified real hash)'+((s.storedRejected||s.storedStale)?', '+(s.storedRejected||0).toLocaleString()+' rejected and '+(s.storedStale||0).toLocaleString()+' stale also kept':'')+(s.storedSince?', since '+new Date(s.storedSince).toLocaleDateString():'')+'. Nothing is sent anywhere.';
 $('ev').innerHTML=s.events.map(e=>'<li>'+new Date(e.t*1000).toLocaleTimeString()+' '+esc(e.text)+'</li>').join('');}catch(e){}}
 function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 $('f').onsubmit=async e=>{e.preventDefault();const r=await fetch('api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({upstream_host:$('h').value.trim(),upstream_port:Number($('p').value)})});
@@ -582,7 +617,7 @@ async def web(r, w):
             status, ctype, out = json_resp({
                 'upstream': f"{cfg['upstream_host']}:{cfg['upstream_port']}", 'stratumPort': STRATUM_PORT,
                 'checked': totals['checked'], 'failed': totals['failed'],
-                'stored': stored['count'], 'storedVerified': stored['verified'], 'storedSince': stored['first'],
+                'stored': stored['count'], 'storedVerified': stored['verified'], 'storedRejected': stored['rejected'], 'storedStale': stored['stale'], 'storedSince': stored['first'],
                 'miners': [{'ip': ip, **{k: v for k, v in mm.items() if k in ('worker', 'checked', 'failed', 'last')}} for ip, mm in miners.items()],
                 'events': list(events)})
         elif method == 'GET' and u.path == '/api/hashes':
@@ -593,9 +628,9 @@ async def web(r, w):
             flush()
             lim = max(1, min(200, int((parse_qs(u.query).get('limit') or ['30'])[0] or 30)))
             con = db_connect()
-            rows = con.execute('SELECT prev, COUNT(*), COALESCE(SUM(verified),0), MIN(t), MAX(t), COALESCE(SUM(diff),0) FROM shares WHERE prev IS NOT NULL GROUP BY prev ORDER BY MAX(id) DESC LIMIT ?', (lim,)).fetchall()
+            rows = con.execute("SELECT prev, SUM(status='accepted'), COALESCE(SUM(verified),0), MIN(t), MAX(t), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), SUM(status='rejected'), SUM(status='stale') FROM shares WHERE prev IS NOT NULL GROUP BY prev ORDER BY MAX(id) DESC LIMIT ?", (lim,)).fetchall()
             con.close()
-            status, ctype, out = json_resp({'current': latest['prev'], 'rounds': [{'prev': p, 'count': n, 'verified': v, 'first': f, 'last': l, 'work': d} for p, n, v, f, l, d in rows]})
+            status, ctype, out = json_resp({'current': latest['prev'], 'rounds': [{'prev': p, 'count': n, 'verified': v, 'first': f, 'last': l, 'work': d, 'rejected': rj, 'stale': stl} for p, n, v, f, l, d, rj, stl in rows]})
         elif method == 'GET' and u.path == '/api/hashes/round':
             # every share of one block: newest first (live view) or the ones after an id (?after=)
             q = parse_qs(u.query)
@@ -607,11 +642,11 @@ async def web(r, w):
                 lim = max(1, min(2000, int((q.get('limit') or ['300'])[0] or 300)))
                 after = int((q.get('after') or ['0'])[0] or 0)
                 con = db_connect()
-                n, v, d, f, l = con.execute('SELECT COUNT(*), COALESCE(SUM(verified),0), COALESCE(SUM(diff),0), MIN(t), MAX(t) FROM shares WHERE prev = ?', (prev,)).fetchone()
-                rows = con.execute(f"SELECT id, t, {wsql(True)}, diff, hash, verified FROM shares WHERE prev = ? AND id > ? ORDER BY id DESC LIMIT ?", (prev, after, lim)).fetchall()
+                n, v, d, f, l, rj, stl = con.execute("SELECT COALESCE(SUM(status='accepted'),0), COALESCE(SUM(verified),0), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), MIN(t), MAX(t), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares WHERE prev = ?", (prev,)).fetchone()
+                rows = con.execute(f"SELECT id, t, {wsql(True)}, diff, hash, verified, status, reason FROM shares WHERE prev = ? AND id > ? ORDER BY id DESC LIMIT ?", (prev, after, lim)).fetchall()
                 con.close()
-                status, ctype, out = json_resp({'prev': prev, 'total': n, 'verified': v, 'work': d, 'first': f, 'last': l,
-                                                'shares': [{'id': i, 't': t, 'miner': wkr, 'diff': df, 'hash': h, 'bits': lz_bits(bytes.fromhex(h)) if h else None, 'verified': bool(vf)} for i, t, wkr, df, h, vf in rows]})
+                status, ctype, out = json_resp({'prev': prev, 'total': n, 'verified': v, 'work': d, 'first': f, 'last': l, 'rejected': rj, 'stale': stl,
+                                                'shares': [{'id': i, 't': t, 'miner': wkr, 'diff': df, 'hash': h, 'bits': lz_bits(bytes.fromhex(h)) if h else None, 'verified': bool(vf), 'status': stt, 'reason': rs} for i, t, wkr, df, h, vf, stt, rs in rows]})
         elif method == 'GET' and re.fullmatch(r'/api/(export|hashes/round)\.(xlsx|pdf|csv)', u.path):
             kind = u.path.rsplit('.', 1)[1]
             fn, ctype = BUILDERS[kind]
