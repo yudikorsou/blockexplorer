@@ -7,7 +7,7 @@ services:
       APP_PORT: 3000
       # the page (and the setting of the pool port) sits behind the Umbrel login; only the read-only list of
       # share hashes is open, so the hashes.space dashboard on your computer can read it
-      PROXY_AUTH_WHITELIST: "/api/hashes"
+      PROXY_AUTH_WHITELIST: "/api/hashes,/api/hashes/*"
 
   web:
     # the official Python image (the same one the other hashes.space apps use), running relay.py: standard library only

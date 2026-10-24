@@ -2,7 +2,7 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: bitsrelay
-version: "1.1.0"
+version: "1.2.0"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
 description: >-
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  Every accepted share is now kept on your Umbrel (with its real hash), and the app page has downloads of your shares as Excel, PDF or CSV, for everything or a range of days.
+  Shares are now saved per block: the hashes.space dashboard can open the block being hashed (live) and every mined block with all the share hashes of your miner, with Excel, PDF and CSV downloads. Shares from earlier versions are kept but have no block.

@@ -58,6 +58,7 @@ seq = 0
 miners = {}                          # ip -> {since, checked, failed, last, worker, pool}
 events = deque(maxlen=30)            # what the status page lists
 totals = {'checked': 0, 'failed': 0}
+latest = {'prev': None, 't': 0}      # the previous-block hash of the newest job the pool sent: the block being hashed now
 
 # ---------------------------------------------------------------- the record of every accepted share
 DB_FILE = os.path.join(DATA, 'shares.db')
@@ -79,13 +80,17 @@ def db_init():
     db = db_connect()
     db.execute('CREATE TABLE IF NOT EXISTS shares (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, worker TEXT, ip TEXT, diff REAL, hash TEXT, verified INTEGER NOT NULL)')
     db.execute('CREATE INDEX IF NOT EXISTS shares_t ON shares (t)')
+    cols = [r[1] for r in db.execute('PRAGMA table_info(shares)')]
+    if 'prev' not in cols:       # the block a share belongs to: the previous-block hash of the job it was made on
+        db.execute('ALTER TABLE shares ADD COLUMN prev TEXT')
+    db.execute('CREATE INDEX IF NOT EXISTS shares_prev ON shares (prev)')
     db.commit()
     n, first, ver = db.execute('SELECT COUNT(*), MIN(t), COALESCE(SUM(verified),0) FROM shares').fetchone()
     stored.update({'count': n, 'first': first, 'verified': ver})
 
 
-def record(t_ms, worker, ip, diff, h):
-    pending.append((t_ms, worker, ip, diff, h, 1 if h else 0))
+def record(t_ms, worker, ip, diff, h, prev=None):
+    pending.append((t_ms, worker, ip, diff, h, 1 if h else 0, prev))
     stored['count'] += 1
     stored['verified'] += 1 if h else 0
     if stored['first'] is None:
@@ -98,7 +103,7 @@ def flush():
     rows = pending[:]
     del pending[:len(rows)]
     try:
-        db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified) VALUES (?,?,?,?,?,?)', rows)
+        db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified, prev) VALUES (?,?,?,?,?,?,?)', rows)
         db.commit()
     except Exception as e:
         pending[:0] = rows      # try again next time; nothing is dropped
@@ -161,7 +166,7 @@ async def relay(client_r, client_w):
                     h = share_hash(job, st['en1'], msg['params'])
             except Exception:
                 h = None
-            st['pending'][msg.get('id')] = (h, st['diff'])
+            st['pending'][msg.get('id')] = (h, st['diff'], job['prev'] if job else None)
 
     def on_pool(msg):
         global seq
@@ -174,10 +179,11 @@ async def relay(client_r, client_w):
         elif method == 'mining.notify' and isinstance(msg.get('params'), list):
             p = msg['params']
             st['jobs'][str(p[0])] = {'prev': str(p[1]), 'c1': str(p[2] or ''), 'c2': str(p[3] or '')}
+            latest.update({'prev': str(p[1]), 't': time.time()})
             while len(st['jobs']) > 32:
                 st['jobs'].pop(next(iter(st['jobs'])))
         elif msg.get('id') in st['pending']:
-            h, diff = st['pending'].pop(msg['id'])
+            h, diff, jprev = st['pending'].pop(msg['id'])
             if msg.get('result') is True:
                 good = None
                 if h:
@@ -187,7 +193,7 @@ async def relay(client_r, client_w):
                     if bits >= need:
                         good = h
                         seq += 1
-                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff})
+                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff, 'prev': jprev})
                         totals['checked'] += 1
                         if m is not None:
                             m['checked'] += 1
@@ -198,7 +204,7 @@ async def relay(client_r, client_w):
                             m['failed'] += 1
                         note(f'a share hash failed the check ({bits} zero bits, {need} needed at difficulty {diff:g})')
                 # every accepted share is kept; its hash only when it passed the check
-                record(int(time.time() * 1000), st['worker'], ip, diff, good)
+                record(int(time.time() * 1000), st['worker'], ip, diff, good, jprev)
         elif isinstance(msg.get('result'), list) and len(msg['result']) >= 2 and isinstance(msg['result'][1], str) and msg.get('id') is not None:
             st['en1'] = msg['result'][1]   # the reply to mining.subscribe: [[subscriptions], extranonce1, extranonce2_size]
 
@@ -253,8 +259,11 @@ def day_bounds(q):
     return one('from', False), one('to', True)
 
 
-def where(t0, t1):
+def where(t0, t1, prev=None):
     cond, args = [], []
+    if prev is not None:
+        cond.append('prev = ?')
+        args.append(prev)
     if t0 is not None:
         cond.append('t >= ?')
         args.append(t0)
@@ -268,12 +277,17 @@ def utc(t_ms, fmt='%Y-%m-%d %H:%M:%S'):
     return time.strftime(fmt, time.gmtime(t_ms / 1000))
 
 
-def summary(con, t0, t1):
-    w, a = where(t0, t1)
+def wsql(anon):
+    """the worker of a share; in the open per-block downloads only its last 6 characters (a worker is usually a payout address)"""
+    return "CASE WHEN worker IS NULL OR worker='' THEN '(unknown)' ELSE '...'||substr(worker,-6) END" if anon else "COALESCE(NULLIF(worker,''),'(unknown)')"
+
+
+def summary(con, t0, t1, prev=None, anon=False):
+    w, a = where(t0, t1, prev)
     n, ver, work, first, last = con.execute(f'SELECT COUNT(*), COALESCE(SUM(verified),0), COALESCE(SUM(diff),0), MIN(t), MAX(t) FROM shares{w}', a).fetchone()
-    workers = con.execute(f"SELECT COALESCE(NULLIF(worker,''),'(unknown)'), COUNT(*), SUM(verified), SUM(diff), MIN(t), MAX(t) FROM shares{w} GROUP BY 1 ORDER BY 2 DESC", a).fetchall()
+    workers = con.execute(f"SELECT {wsql(anon)}, COUNT(*), SUM(verified), SUM(diff), MIN(t), MAX(t) FROM shares{w} GROUP BY 1 ORDER BY 2 DESC", a).fetchall()
     days = con.execute(f"SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch') d, COUNT(*), SUM(verified), SUM(diff) FROM shares{w} GROUP BY d ORDER BY d", a).fetchall()
-    best = con.execute(f"SELECT hash, t, COALESCE(NULLIF(worker,''),'(unknown)'), diff FROM shares{w}{' AND' if w else ' WHERE'} hash IS NOT NULL ORDER BY hash ASC LIMIT 10", a).fetchall()
+    best = con.execute(f"SELECT hash, t, {wsql(anon)}, diff FROM shares{w}{' AND' if w else ' WHERE'} hash IS NOT NULL ORDER BY hash ASC LIMIT 10", a).fetchall()
     return {'n': n, 'ver': ver, 'work': work, 'first': first, 'last': last, 'workers': workers, 'days': days, 'best': best}
 
 
@@ -284,12 +298,12 @@ def period_text(t0, t1, s):
 
 
 # --- CSV
-def build_csv(path, t0, t1):
+def build_csv(path, t0, t1, prev=None, label=None, anon=False):
     con = db_connect()
-    w, a = where(t0, t1)
+    w, a = where(t0, t1, prev)
     with open(path, 'w', newline='') as f:
         f.write('number,time_utc,worker,miner_address,difficulty,hash,zero_bits,hash_verified\r\n')
-        for i, (t, wk, ip, d, h, v) in enumerate(con.execute(f'SELECT t, worker, ip, diff, hash, verified FROM shares{w} ORDER BY id', a), 1):
+        for i, (t, wk, ip, d, h, v) in enumerate(con.execute(f"SELECT t, {wsql(anon)}, {'NULL' if anon else 'ip'}, diff, hash, verified FROM shares{w} ORDER BY id", a), 1):
             f.write(f'{i},{utc(t)},"{(wk or "").replace(chr(34), "")}",{ip or ""},{d:g},{h or ""},{lz_bits(bytes.fromhex(h)) if h else ""},{"yes" if v else "no"}\r\n')
     con.close()
 
@@ -333,15 +347,15 @@ SHEET_OPEN = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet 
 MAX_ROWS = 1_000_000                   # a sheet holds 1,048,576 rows; the next sheet takes over after this many
 
 
-def build_xlsx(path, t0, t1):
+def build_xlsx(path, t0, t1, prev=None, label=None, anon=False):
     con = db_connect()
-    s = summary(con, t0, t1)
-    w, a = where(t0, t1)
+    s = summary(con, t0, t1, prev, anon)
+    w, a = where(t0, t1, prev)
     names = ['Summary']
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         # Summary sheet
         r = 1
-        rows = [[('b', 'bitsrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
+        rows = [[('b', label or 'bitsrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
                 [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Total difficulty (work)'), s['work']], [],
                 [('b', 'Per worker')], [('b', 'Worker'), ('b', 'Shares'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'First share'), ('b', 'Last share')]]
         for wk, n, v, d, f, l in s['workers']:
@@ -359,7 +373,7 @@ def build_xlsx(path, t0, t1):
             f.write(b'</sheetData></worksheet>')
         # the shares: every one, in as many sheets as it takes
         head = [('b', x) for x in ('#', 'Time (UTC)', 'Worker', 'Miner address', 'Difficulty', 'Hash', 'Zero bits', 'Hash verified')]
-        cur = con.execute(f'SELECT t, worker, ip, diff, hash, verified FROM shares{w} ORDER BY id', a)
+        cur = con.execute(f"SELECT t, {wsql(anon)}, {'NULL' if anon else 'ip'}, diff, hash, verified FROM shares{w} ORDER BY id", a)
         k, sheet, f, r = 0, 1, None, 0
         for k, (t, wk, ip, d, h, v) in enumerate(cur, 1):
             if f is None or r > MAX_ROWS:
@@ -452,13 +466,13 @@ class Pdf:
             f.write(out)
 
 
-def build_pdf(path, t0, t1):
+def build_pdf(path, t0, t1, prev=None, label=None, anon=False):
     con = db_connect()
-    s = summary(con, t0, t1)
+    s = summary(con, t0, t1, prev, anon)
     con.close()
     p = Pdf()
     M = p.M
-    p.text(M, 'bitsrelay: shares relayed', 'F2', 20)
+    p.text(M, label or 'bitsrelay: shares relayed', 'F2', 20)
     p.y -= 26
     p.line([f'Period: {period_text(t0, t1, s)}'], [M])
     p.line([f"Generated: {utc(time.time() * 1000)} UTC. Days are UTC days."], [M])
@@ -574,17 +588,55 @@ async def web(r, w):
         elif method == 'GET' and u.path == '/api/hashes':
             since = int((parse_qs(u.query).get('since') or ['0'])[0] or 0)
             status, ctype, out = json_resp({'stratumPort': STRATUM_PORT, 'seq': seq, 'shares': [s for s in shares if s['seq'] > since]})
-        elif method == 'GET' and re.fullmatch(r'/api/export\.(xlsx|pdf|csv)', u.path):
+        elif method == 'GET' and u.path == '/api/hashes/rounds':
+            # the blocks the shares were made for (a round = all shares on jobs that build on the same previous block), newest first
+            flush()
+            lim = max(1, min(200, int((parse_qs(u.query).get('limit') or ['30'])[0] or 30)))
+            con = db_connect()
+            rows = con.execute('SELECT prev, COUNT(*), COALESCE(SUM(verified),0), MIN(t), MAX(t), COALESCE(SUM(diff),0) FROM shares WHERE prev IS NOT NULL GROUP BY prev ORDER BY MAX(id) DESC LIMIT ?', (lim,)).fetchall()
+            con.close()
+            status, ctype, out = json_resp({'current': latest['prev'], 'rounds': [{'prev': p, 'count': n, 'verified': v, 'first': f, 'last': l, 'work': d} for p, n, v, f, l, d in rows]})
+        elif method == 'GET' and u.path == '/api/hashes/round':
+            # every share of one block: newest first (live view) or the ones after an id (?after=)
+            q = parse_qs(u.query)
+            prev = (q.get('prev') or [''])[0]
+            if not re.fullmatch(r'[0-9a-fA-F]{64}', prev):
+                status, ctype, out = json_resp({'error': 'prev must be 64 hex characters'}, 400)
+            else:
+                flush()
+                lim = max(1, min(2000, int((q.get('limit') or ['300'])[0] or 300)))
+                after = int((q.get('after') or ['0'])[0] or 0)
+                con = db_connect()
+                n, v, d, f, l = con.execute('SELECT COUNT(*), COALESCE(SUM(verified),0), COALESCE(SUM(diff),0), MIN(t), MAX(t) FROM shares WHERE prev = ?', (prev,)).fetchone()
+                rows = con.execute(f"SELECT id, t, {wsql(True)}, diff, hash, verified FROM shares WHERE prev = ? AND id > ? ORDER BY id DESC LIMIT ?", (prev, after, lim)).fetchall()
+                con.close()
+                status, ctype, out = json_resp({'prev': prev, 'total': n, 'verified': v, 'work': d, 'first': f, 'last': l,
+                                                'shares': [{'id': i, 't': t, 'miner': wkr, 'diff': df, 'hash': h, 'bits': lz_bits(bytes.fromhex(h)) if h else None, 'verified': bool(vf)} for i, t, wkr, df, h, vf in rows]})
+        elif method == 'GET' and re.fullmatch(r'/api/(export|hashes/round)\.(xlsx|pdf|csv)', u.path):
             kind = u.path.rsplit('.', 1)[1]
             fn, ctype = BUILDERS[kind]
-            t0, t1 = day_bounds(parse_qs(u.query))
+            q = parse_qs(u.query)
+            t0, t1 = day_bounds(q)
+            prev, label, anon, slug = None, None, False, 'shares'
+            if u.path.startswith('/api/hashes/round'):
+                prev = (q.get('prev') or [''])[0]
+                if not re.fullmatch(r'[0-9a-fA-F]{64}', prev):
+                    raise ValueError('prev')
+                if prev.lower() == (latest['prev'] or '').lower():
+                    # the block being hashed has no download: its page is a live view; a block is downloadable once it has been mined
+                    w.write(b'HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{"error":"The block being hashed can be downloaded once mined."}')
+                    await w.drain()
+                    return
+                anon = True    # open to the dashboard without a login: a worker (a payout address) is cut to its last 6 characters
+                label = re.sub(r'[^A-Za-z0-9 #.,:()-]', '', (q.get('label') or [''])[0])[:60].strip() or 'Block shares'
+                slug = re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-') or 'block'
             flush()
             tmp = tempfile.NamedTemporaryFile(dir=tempfile.gettempdir(), suffix='.' + kind, delete=False)
             tmp.close()
             try:
-                await asyncio.get_event_loop().run_in_executor(None, fn, tmp.name, t0, t1)
+                await asyncio.get_event_loop().run_in_executor(None, lambda: fn(tmp.name, t0, t1, prev, label, anon))
                 size = os.path.getsize(tmp.name)
-                name = f"bitsrelay-shares-{time.strftime('%Y-%m-%d', time.gmtime())}.{kind}"
+                name = f"bitsrelay-{slug}-{time.strftime('%Y-%m-%d', time.gmtime())}.{kind}"
                 w.write(f'HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {size}\r\nContent-Disposition: attachment; filename="{name}"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n'.encode())
                 with open(tmp.name, 'rb') as fh:
                     while True:
