@@ -314,6 +314,23 @@ def wsql(anon):
     return "CASE WHEN worker IS NULL OR worker='' THEN '(unknown)' ELSE '...'||substr(worker,-6) END" if anon else "COALESCE(NULLIF(worker,''),'(unknown)')"
 
 
+def diff_info(con, w, a):
+    """the share difficulty over a period: lowest, highest and how often it changed (the pool can change it mid-block)"""
+    try:
+        lo, hi, ch = con.execute(f"SELECT MIN(diff), MAX(diff), COALESCE(SUM(diff != pd), 0) FROM (SELECT diff, LAG(diff) OVER (ORDER BY id) pd FROM shares{w})", a).fetchone()
+        return {'min': lo, 'max': hi, 'changes': int(ch or 0)}
+    except sqlite3.Error:
+        return {'min': None, 'max': None, 'changes': 0}
+
+
+def diff_text(d):
+    if d['min'] is None:
+        return '-'
+    if d['min'] == d['max']:
+        return f"{d['min']:,.0f} (no change)"
+    return f"{d['min']:,.0f} to {d['max']:,.0f}, changed {d['changes']} times"
+
+
 def summary(con, t0, t1, prev=None, anon=False):
     w, a = where(t0, t1, prev)
     wa = (w + ' AND' if w else ' WHERE') + " status='accepted'"
@@ -321,7 +338,7 @@ def summary(con, t0, t1, prev=None, anon=False):
     workers = con.execute(f"SELECT {wsql(anon)}, SUM(status='accepted'), SUM(verified), SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END), SUM(status='rejected'), SUM(status='stale'), MIN(t), MAX(t) FROM shares{w} GROUP BY 1 ORDER BY 2 DESC", a).fetchall()
     days = con.execute(f"SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch') d, SUM(status='accepted'), SUM(verified), SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END), SUM(status!='accepted') FROM shares{w} GROUP BY d ORDER BY d", a).fetchall()
     best = con.execute(f"SELECT hash, t, {wsql(anon)}, diff FROM shares{wa} AND hash IS NOT NULL ORDER BY hash ASC LIMIT 10", a).fetchall()
-    return {'n': n, 'ver': ver, 'work': work, 'rej': rej, 'stale': stale, 'first': first, 'last': last, 'workers': workers, 'days': days, 'best': best}
+    return {'n': n, 'ver': ver, 'work': work, 'rej': rej, 'stale': stale, 'first': first, 'last': last, 'workers': workers, 'days': days, 'best': best, 'diff': diff_info(con, w, a)}
 
 
 def period_text(t0, t1, s):
@@ -389,7 +406,7 @@ def build_xlsx(path, t0, t1, prev=None, label=None, anon=False):
         # Summary sheet
         r = 1
         rows = [[('b', label or 'bitsrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
-                [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Rejected shares'), s['rej']], [('b', 'Stale shares'), s['stale']], [('b', 'Total difficulty (work)'), s['work']], [],
+                [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Rejected shares'), s['rej']], [('b', 'Stale shares'), s['stale']], [('b', 'Total difficulty (work)'), s['work']], [('b', 'Share difficulty at the time'), diff_text(s['diff'])], [],
                 [('b', 'Per worker')], [('b', 'Worker'), ('b', 'Accepted'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'Rejected'), ('b', 'Stale'), ('b', 'First share'), ('b', 'Last share')]]
         for wk, n, v, d, rj, stl, f, l in s['workers']:
             rows.append([wk, n or 0, v or 0, d or 0, rj or 0, stl or 0, ('d', f), ('d', l)])
@@ -516,6 +533,7 @@ def build_pdf(path, t0, t1, prev=None, label=None, anon=False):
     p.line(['Rejected shares', f"{s['rej']:,}"], [M, 230])
     p.line(['Stale shares', f"{s['stale']:,}"], [M, 230])
     p.line(['Total difficulty (work)', f"{s['work']:,.0f}"], [M, 230])
+    p.line(['Share difficulty at the time', diff_text(s['diff'])], [M, 230])
     p.gap(12)
     p.line(['Per worker'], [M], 'F2', 11)
     xs = [M, 190, 245, 300, 375, 420, 480]
@@ -644,8 +662,9 @@ async def web(r, w):
                 con = db_connect()
                 n, v, d, f, l, rj, stl = con.execute("SELECT COALESCE(SUM(status='accepted'),0), COALESCE(SUM(verified),0), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), MIN(t), MAX(t), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares WHERE prev = ?", (prev,)).fetchone()
                 rows = con.execute(f"SELECT id, t, {wsql(True)}, diff, hash, verified, status, reason FROM shares WHERE prev = ? AND id > ? ORDER BY id DESC LIMIT ?", (prev, after, lim)).fetchall()
+                dinfo = diff_info(con, ' WHERE prev = ?', (prev,))
                 con.close()
-                status, ctype, out = json_resp({'prev': prev, 'total': n, 'verified': v, 'work': d, 'first': f, 'last': l, 'rejected': rj, 'stale': stl,
+                status, ctype, out = json_resp({'prev': prev, 'total': n, 'verified': v, 'work': d, 'first': f, 'last': l, 'rejected': rj, 'stale': stl, 'difficulty': dinfo,
                                                 'shares': [{'id': i, 't': t, 'miner': wkr, 'diff': df, 'hash': h, 'bits': lz_bits(bytes.fromhex(h)) if h else None, 'verified': bool(vf), 'status': stt, 'reason': rs} for i, t, wkr, df, h, vf, stt, rs in rows]})
         elif method == 'GET' and re.fullmatch(r'/api/(export|hashes/round)\.(xlsx|pdf|csv)', u.path):
             kind = u.path.rsplit('.', 1)[1]

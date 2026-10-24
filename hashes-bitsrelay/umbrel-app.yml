@@ -2,7 +2,7 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: bitsrelay
-version: "1.3.0"
+version: "1.3.1"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
 description: >-
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  Rejected and stale shares are now kept too, with what the pool said about them. They show in the block share pages, the Excel, PDF and CSV downloads (status and reason columns), and the totals.
+  The share difficulty at the time is shown per block (lowest, highest and how often the pool changed it mid-block) in the downloads and on the block pages. Rejected and stale shares are kept too.
