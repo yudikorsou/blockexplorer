@@ -1,0 +1,39 @@
+manifestVersion: 1
+id: hashes-hashrelay
+category: crypto
+name: hashrelay
+version: "1.0.0"
+tagline: Real share hashes for your hashes.space dashboard
+icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
+description: >-
+  A small relay that sits between your miner and your pool port (for example DATUM Gateway on this Umbrel).
+  It passes everything on unchanged, and works out the real BLAKE2b hash of every share the pool accepts, so
+  the bits that fly into the block on the hashes.space dashboard are the real bits of your miner's work, not
+  generated ones.
+
+
+  It holds no keys, no payout address and no settings of your miner. A hash is only offered to the dashboard
+  after it passes a check against the share difficulty, so a wrong hash is never shown. If hashrelay is stopped,
+  a miner with a second pool entry falls back to it and keeps hashing.
+
+
+  Set it up: install the app, open it and check the pool port it forwards to (it starts on this Umbrel, port
+  23339), then change your miner's pool to this Umbrel's address and port 23340 and keep your old pool as the
+  second pool. The hashes.space dashboard finds the relay on your Umbrel by itself.
+
+
+  Works with the Bitcoin BLAKE2b chain (header v2) as a pooled miner, such as a Goldshell, mines it.
+developer: hashes.space
+website: https://hashes.space
+dependencies: []
+repo: https://github.com/yudikorsou/blockexplorer
+support: https://github.com/yudikorsou/blockexplorer/issues
+port: 4086
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: yudikorsou
+submission: https://github.com/yudikorsou/blockexplorer
+releaseNotes: >-
+  First release: the relay on port 23340 with real share hashes for the hashes.space dashboard, and a page to set the pool port it forwards to.
