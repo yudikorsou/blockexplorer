@@ -1,0 +1,73 @@
+manifestVersion: 1
+id: hashes-bitcoin-explorer
+category: crypto
+name: Bitcoin Explorer
+version: "1.18.29"
+tagline: A Bitcoin block explorer on your own Bitcoin node, pruned or not
+icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin.png
+description: >-
+  A light Bitcoin block explorer that reads blocks, fees, mining pools and the mempool straight from the
+  Bitcoin Node app on your Umbrel: no third party sees what you look up. A pruned node is enough for the
+  newest blocks, which is what a live view needs. Search by block height, block hash or transaction id.
+
+
+  It also offers mempool's API and WebSocket (/api/v1/blocks, /api/v1/fees/mempool-blocks,
+  /api/v1/ws) and the global hashrate and mining pool statistics, worked out from your node, so the
+  hashes.space Find Mempool page can stream Bitcoin from your own node. Publish it on the internet (for
+  example with the Cloudflare Tunnel app, as btc.hashes.space) to make it the Bitcoin explorer of your website.
+
+
+  Requires the Bitcoin Node app, synced. While it is still syncing, the explorer says so and the page
+  shows simulated blocks. /api/v1/status shows what the explorer sees of your node.
+developer: hashes.space
+website: https://hashes.space
+dependencies:
+  - bitcoin
+repo: https://github.com/yudikorsou/blockexplorer
+support: https://github.com/yudikorsou/blockexplorer/issues
+port: 4084
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: yudikorsou
+submission: https://github.com/yudikorsou/blockexplorer
+releaseNotes: >-
+  Security: address lookups and the payout addresses of protected pools need the Discord sign-in (no fallback), the sign-in redirect only accepts a plain local path, and the server drops slow clients and caps connections and WebSocket messages.
+  Block page: the Every transaction hash going into the block animation is hidden.
+  Fee auction page: the Fees to aim for line is gone from The price of the next block step.
+  Fee auction and Package sorting pages: no individual transactions are listed any more, only the totals and the fee rates of the steps.
+  Fee auction page: the transaction links are gone from the Read every bid step.
+  Package sorting page: the transaction links are gone from the Group them into packages step.
+  Package sorting page: the Rank by package fee rate step is gone; three steps are left (look at the mempool, group them into packages, fill the block).
+  Block assembly page: the Select the best packages step is gone; three steps are left (coinbase, check the limits, finalize the template).
+  New /api/v1/mining/period-blocks/<height>: up to 15 blocks from that height down to the first block of the current difficulty period, with the fees and the pool of each, so the blockchain on hashes.space can show every block of the period. Update this app together with hashes.space.
+  New /api/v1/mining/next-block: the average wait for the next block, worked out from the pace of the last 288 blocks (newest weigh most, block timestamps) and the difficulty of the next block. It powers the "Next block in approx." timer on hashes.space.
+  Block page: the Block diagrams section (what fills the block, transactions by fee rate and by size) is gone.
+  Block page: the transaction animation sits straight on the page (the card behind it is gone) and the block is more 3D: deeper lit top and shaded side faces, edge highlights and a soft shadow.
+  Block page: the Transactions, Fees, Fullness and Size tiles are gone; a Transaction fees tile shows the fees paid in the mined block. Every leading zero of the block hash is coloured, with the number of leading zeros below it.
+  Block page: the block hash is now the main element, a large card right under the title with the leading zeros dimmed, the rest in bold white and a Copy button.
+  Fix: the Block assembly page could crash the explorer (a bad gateway) on a block version with the top bit set, as version-bit signalling gives. The header now handles it, and any page error shows a readable message instead.
+  Node details are gone from the explorer: no more node sync, pruned/full, peers, the Live banner, the Can be replaced row or the Read from your own node lines. Only blockchain information is shown.
+  New page /fee-auction: your node's mempool as an auction. Every waiting transaction bids a fee rate for the next block: the bids ranked from the highest, where they land (block 1, 2, 3...), the lowest bid that still makes the next block and the fees to aim for. Open it from the Fee Auction block on hashes.space.
+  New page /package-sorting: how your node fills the block it would build, read live from its block template and mempool: the waiting transactions, packages of a cheap parent with a child that pays well, the packages ranked by fee rate, and the block being filled up to the weight limit. Open it from the Create new block block on hashes.space.
+  New page /block-assembly: the block your node would build right now, read live from your node's getblocktemplate. Four steps (coinbase with the subsidy and fees, the transactions picked by fee rate, the weight and sigop limits, the 80-byte header with the merkle root), an animated block and the header field by field. Open it from the Block assembly block on hashes.space.
+  Block page: the Mining card (pool, coinbase text, paid to) is removed. The pool is still named at the top of the block and the pool pages on hashes.space show the pool information when a block is clicked.
+  Bitcoin BLAKE2b explorer: payout addresses, coinbase and the whole block are no longer behind Get verified for any pool; everyone sees them. On the Bitcoin explorer only blocks mined by OCEAN still ask for DATUM Verified.
+  New endpoint /api/v1/mining/block/<hash|height>: the pool information of one block (pool, the text in the coinbase and who the block reward was paid to). The pool page on hashes.space opens it when someone clicks a block.
+  New period "epoch" on /api/v1/mining/pools, /mining/solo, /mining/pool-hashrate and /mining/hashrate: the blocks since the last difficulty adjustment (the current 2016-block period), which starts over at each new adjustment. The pools and solo answers also give epochStart, nextAdjustment and epochBlocks.
+  The pool blocks endpoint /api/v1/mining/pool/<slug>/blocks/epoch now returns every block a pool mined since the last difficulty adjustment (the first block of the current 2016-block period) and starts over at each new adjustment. /blocks/14d is kept as an alias.
+  A mining pool's block list now covers its last 14 days: /api/v1/mining/pool/<slug>/blocks/14d returns every block the pool mined in the last difficulty period, with its weight, median fee and fee range, so the Find Mempool pool profile page can show them all as miniature blocks.
+  The block animation is no longer shown on the Bitcoin BLAKE2b explorer or on blocks mined by OCEAN on the Bitcoin explorer.
+  Get verified now applies to every pool on the Bitcoin BLAKE2b explorer, and on the Bitcoin explorer only to blocks mined by OCEAN; other Bitcoin blocks show their payout addresses and the whole block to everyone.
+  The Get verified box has new wording (only DATUM Verified pool contributors see the transaction information of the pool they hash on) and a boxed layout that no longer breaks words.
+  The block page shows the difficulty of Bitcoin BLAKE2b blocks (the hashes a block takes, worked out from its bits) instead of 0.
+  The block animation shows the first three transactions to visitors who are not verified, then the Get verified button; verified members see the whole block. The transaction list is removed from the block page.
+  The block diagrams and block statistics match the rest of the block page: every chart is its own card with a divider under its title, the statistics are tiles with a short explanation under each value and a bar for the SegWit and Taproot shares, and the section titles are small capitals.
+  Payout addresses are now hidden behind a Get verified button on the block, transaction and address pages and in the block animation, until the visitor signs in with Discord and holds the DATUM Verified role (set it up with a discord.json file in the app's data folder, see the README).
+  The block page has a structured layout: title row with the pool, time, confirmations and previous/next buttons, key figures as tiles (transactions, fees, reward, fullness, size), then the details grouped in Mining and Header cards.
+  Housekeeping: the explorer no longer mentions any outside site; while it syncs the page shows simulated blocks.
+  New /api/v1/mining/solo/<period>: the hashrate of miners that use no pool, estimated from the blocks of solo services and the blocks with no known pool, times the network's hashrate (an upper bound).
+  The Find Mempool page's hashrate section now shows the combined hashrate of the mining pools (14 days, 1 month, 6 months, 1 year) instead of the whole network's: new /api/v1/mining/pool-hashrate/<period>, the network's hashrate times the share of blocks that pools mined. The share of blocks per day is kept on disk, so on a pruned node the 6-month and 1-year charts keep growing beyond the 30 days it can read.
+  New /api/v1/block-template: the header of the block being mined now, from your node's getblocktemplate, with the merkle root of that template (the nonce is only known once a block is found).
+  Block animation headline: Every transaction hash going into block <number>.

@@ -1,0 +1,39 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: hashes-site_web_1
+      APP_PORT: 3000
+      # a public website: no Umbrel login in front of it
+      PROXY_AUTH_ADD: "false"
+
+  web:
+    # the official Python image (the same one the explorers use), running site.py: standard library only
+    image: python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    environment:
+      HOME: /tmp
+      PORT: "3000"
+      SITE_DIR: /site
+      # the Monero Node app on this Umbrel: the Find Mempool page's Monero hashrate and payout split
+      MONERO_HOST: ${APP_MONERO_NODE_IP}
+      MONERO_RPC_PORT: ${APP_MONERO_RPC_PORT}
+      MONERO_RPC_AUTH: ${APP_MONERO_RPC_AUTH}
+      # the Bitcoin Node app on this Umbrel: the Find Mempool page's Bitcoin SHA-256 hashrate and pool split
+      APP_BITCOIN_NODE_IP: ${APP_BITCOIN_NODE_IP:-}
+      APP_BITCOIN_RPC_PORT: ${APP_BITCOIN_RPC_PORT:-}
+      APP_BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER:-}
+      APP_BITCOIN_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-}
+      # the Bitcoin Knots app (the BLAKE2b chain), when it is installed next to it: Bitcoin BLAKE2b hashrate and pool split
+      APP_BITCOIN_KNOTS_NODE_IP: ${APP_BITCOIN_KNOTS_NODE_IP:-}
+      APP_BITCOIN_KNOTS_INTERNAL_RPC_PORT: ${APP_BITCOIN_KNOTS_INTERNAL_RPC_PORT:-}
+      APP_BITCOIN_KNOTS_RPC_PORT: ${APP_BITCOIN_KNOTS_RPC_PORT:-}
+      APP_BITCOIN_KNOTS_RPC_USER: ${APP_BITCOIN_KNOTS_RPC_USER:-}
+      APP_BITCOIN_KNOTS_RPC_PASS: ${APP_BITCOIN_KNOTS_RPC_PASS:-}
+    volumes:
+      - ${APP_DATA_DIR}/site.py:/app/site.py:ro
+      - ${APP_DATA_DIR}/mempool.html:/site/index.html:ro
+    command: ["python3", "-u", "/app/site.py"]

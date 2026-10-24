@@ -1,0 +1,55 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # the stats service stands in front of the explorer: it passes everything on and adds /api/v1/mining/...
+      APP_HOST: hashes-monero-explorer_stats_1
+      APP_PORT: 3000
+      # a public block explorer: no Umbrel login in front of it (it is read-only)
+      PROXY_AUTH_ADD: "false"
+
+  explorer:
+    # Onion Monero Blockchain Explorer (xmrblocks), built by .github/workflows/monero-explorer-image.yml
+    image: ghcr.io/yudikorsou/hashes-monero-explorer:v0.18.5.1-r7@sha256:106ab2a4d4f4ab499b66f58f368ed6423f9c23f1cb796a96253b8317212d64f5
+    user: "1000:1000"
+    restart: on-failure
+    stop_grace_period: 1m
+    # LMDB marks each reader process with a lock at the byte offset of its process ID in lock.mdb. In its
+    # own container xmrblocks gets a small PID that monerod (in the Monero Node's container) also has, so
+    # opening the blockchain fails with "Resource temporarily unavailable". Host PIDs never collide with those.
+    pid: host
+    volumes:
+      # the Monero Node app's blockchain: xmrblocks opens its LMDB database read-only
+      # (mounted read-write only because LMDB readers share the database's lock file)
+      - ${APP_MONERO_DATA_DIR}:/home/monero/.bitmonero
+    command:
+      - >-
+        ./xmrblocks
+        --daemon-url=${APP_MONERO_NODE_IP}:${APP_MONERO_RPC_PORT}
+        --daemon-login=${APP_MONERO_RPC_AUTH}
+        --enable-json-api
+        --enable-autorefresh-option
+        --mempool-refresh-time=10
+        --no-blocks-on-index=25
+
+  stats:
+    # the official Python image (the same one the other hashes.space apps use), running stats.py: standard library only.
+    # It forwards every request to the explorer and answers /api/v1/mining/hashrate/1y and /pools/1w from your Monero node.
+    image: python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+    user: "1000:1000"
+    restart: on-failure
+    init: true
+    depends_on:
+      - explorer
+    environment:
+      HOME: /tmp
+      PORT: "3000"
+      EXPLORER_HOST: explorer
+      EXPLORER_PORT: "8081"
+      MONERO_HOST: ${APP_MONERO_NODE_IP}
+      MONERO_RPC_PORT: ${APP_MONERO_RPC_PORT}
+      MONERO_RPC_AUTH: ${APP_MONERO_RPC_AUTH}
+    volumes:
+      - ${APP_DATA_DIR}/stats.py:/app/stats.py:ro
+    command: ["python3", "-u", "/app/stats.py"]

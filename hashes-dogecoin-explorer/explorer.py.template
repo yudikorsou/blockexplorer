@@ -1,0 +1,2013 @@
+"""Dogecoin block explorer for Umbrel, on your own Dogecoin Core node (Python standard library only).
+
+Reads everything from the Dogecoin Core app's RPC: blocks (parsed from the raw block, AuxPoW included),
+transactions and the mempool. Serves:
+
+  /                      latest blocks and the mempool
+  /block/<hash|height>   a block with its transactions, each drawn from sender address to receiver address
+  /verified              the verified donation addresses of organisations that help animals (also /address/<address>, /api/v1/verified-addresses)
+  /search?q=             height, block hash or address
+  /api/v1/blocks         the last blocks, in mempool's format (for hashes.space)
+  /api/v1/fees/mempool-blocks   the mempool cut into blocks of 1 MB, best fee first
+  /api/blocks/tip/height
+  /fee-sorting, /coinbase-merkle, /block-assembly, /block-candidate   the four blocks of the Find Mempool page, one page each (and as .json): the block your node would build
+  /api/v1/mining/hashrate/<period>  global hashrate and difficulty, from your node (period: blocks, 24h, 14d, 1m, 6m, 1y; "blocks" = the last 1,440 blocks, read with DigiShield's per-block difficulty)
+  /api/v1/mining/period-blocks/<height>  up to 15 blocks from that height down, to a day back (the blockchain on hashes.space swipes back through them)
+  /api/v1/mining/next-block         when the next block is expected: the average wait, from the pace of the last 480 blocks and the next block's difficulty
+  /api/v1/mining/block/<id>         one block's pool, coinbase text and every payout address, for the pool page on hashes.space
+  /api/v1/mining/pool/<slug>/blocks the blocks one pool mined in the last day (1,440 blocks), for the pool page on hashes.space
+  /api/v1/mining/pools/<period>     blocks per mining pool over the period (a sample of the blocks for the long ones)
+  /api/v1/mining/pool-hashrate/<period>  the hashrate of the mining pools together: the network's hashrate times the share of blocks that pools mined
+  /api/v1/mining/solo/<period>      the hashrate of the miners that use no pool: blocks whose coinbase names no known pool, times the network's hashrate (an upper bound)
+  (1y and 1w are what older versions of the page ask for, and are still answered)
+  /api/v1/ws             mempool's WebSocket: {"action":"want","data":["blocks","mempool-blocks"]}
+
+Fees are in koinu per byte (1 DOGE = 100,000,000 koinu).
+"""
+
+import base64
+import hashlib
+import html
+import json
+import math
+import os
+import re
+import socket
+import struct
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("PORT", "3000"))
+RPC_URL = "http://" + os.environ["RPC_HOST"] + ":" + os.environ["RPC_PORT"] + "/"
+AUTH = "Basic " + base64.b64encode((os.environ["RPC_USER"] + ":" + os.environ["RPC_PASS"]).encode()).decode()
+COIN = 100_000_000
+SUBSIDY = 10_000 * COIN  # every Dogecoin block since height 600,000
+MAX_BLOCK = 1_000_000
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def log(msg):
+    print("[explorer] " + msg, flush=True)
+
+
+class RpcError(Exception):
+    pass
+
+
+def rpc(method, *params, timeout=30):
+    body = json.dumps({"jsonrpc": "1.0", "id": "x", "method": method, "params": list(params)}).encode()
+    req = urllib.request.Request(RPC_URL, data=body, headers={"Authorization": AUTH, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read())
+        except Exception:  # noqa: BLE001
+            raise RpcError("HTTP " + str(exc.code))
+    except OSError as exc:
+        raise RpcError("Dogecoin Core is not reachable: " + str(exc))
+    if payload.get("error"):
+        raise RpcError(payload["error"].get("message", "RPC error"))
+    return payload["result"]
+
+
+def rpc_batch(calls):
+    """several RPC calls in one request: [(method, params), ...] -> results (None where a call failed)"""
+    body = json.dumps([{"jsonrpc": "1.0", "id": i, "method": m, "params": list(p)} for i, (m, p) in enumerate(calls)]).encode()
+    req = urllib.request.Request(RPC_URL, data=body, headers={"Authorization": AUTH, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            out = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        out = json.loads(exc.read())
+    except OSError as exc:
+        raise RpcError("Dogecoin Core is not reachable: " + str(exc))
+    res = [None] * len(calls)
+    for item in out:
+        if not item.get("error"):
+            res[item["id"]] = item["result"]
+    return res
+
+
+# ---------- raw block and transaction parsing (Dogecoin: no SegWit, AuxPoW merge-mined headers) ----------
+
+def sha256d(b):
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+
+class Reader:
+    def __init__(self, data):
+        self.d = data
+        self.i = 0
+
+    def take(self, n):
+        out = self.d[self.i:self.i + n]
+        if len(out) < n:
+            raise ValueError("block data ended early")
+        self.i += n
+        return out
+
+    def u32(self):
+        return struct.unpack("<I", self.take(4))[0]
+
+    def i32(self):
+        return struct.unpack("<i", self.take(4))[0]
+
+    def u64(self):
+        return struct.unpack("<Q", self.take(8))[0]
+
+    def varint(self):
+        n = self.take(1)[0]
+        if n < 0xFD:
+            return n
+        return struct.unpack("<" + {0xFD: "H", 0xFE: "I", 0xFF: "Q"}[n], self.take({0xFD: 2, 0xFE: 4, 0xFF: 8}[n]))[0]
+
+    def varbytes(self):
+        return self.take(self.varint())
+
+
+def read_tx(r):
+    start = r.i
+    version = r.i32()
+    vin = []
+    for _ in range(r.varint()):
+        prev = r.take(32)[::-1].hex()
+        index = r.u32()
+        script = r.varbytes()
+        seq = r.u32()
+        vin.append({"prev": prev, "n": index, "script": script, "seq": seq})
+    vout = []
+    for _ in range(r.varint()):
+        value = r.u64()
+        vout.append({"value": value, "script": r.varbytes()})
+    locktime = r.u32()
+    raw = r.d[start:r.i]
+    return {"txid": sha256d(raw)[::-1].hex(), "version": version, "vin": vin, "vout": vout, "locktime": locktime, "size": len(raw),
+            "coinbase": len(vin) == 1 and vin[0]["prev"] == "0" * 64}
+
+
+def parse_block(raw_hex):
+    r = Reader(bytes.fromhex(raw_hex))
+    version = r.i32()
+    r.take(76)  # rest of the 80-byte header
+    parent_coinbase = None
+    if version & 0x100:  # AuxPoW: the block was merge-mined (with Litecoin, mostly)
+        parent_coinbase = read_tx(r)
+        r.take(32)
+        r.take(32 * r.varint())
+        r.take(4)
+        r.take(32 * r.varint())
+        r.take(4)
+        r.take(80)
+    txs = [read_tx(r) for _ in range(r.varint())]
+    return {"txs": txs, "parent_coinbase": parent_coinbase}
+
+
+# ---------- addresses (base58check, Dogecoin mainnet) ----------
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58check(prefix, payload):
+    data = bytes([prefix]) + payload
+    data += sha256d(data)[:4]
+    n = int.from_bytes(data, "big")
+    out = ""
+    while n:
+        n, rem = divmod(n, 58)
+        out = B58[rem] + out
+    return "1" * (len(data) - len(data.lstrip(b"\0"))) + out
+
+
+def address(script):
+    if len(script) == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
+        return b58check(0x1E, script[3:23])  # P2PKH, starts with D
+    if len(script) == 23 and script[:2] == b"\xa9\x14" and script[22] == 0x87:
+        return b58check(0x16, script[2:22])  # P2SH, starts with 9 or A
+    if len(script) in (35, 67) and script[-1] == 0xAC:
+        return b58check(0x1E, hashlib.new("ripemd160", hashlib.sha256(script[1:-1]).digest()).digest())  # P2PK
+    if script[:1] == b"\x6a":
+        return "OP_RETURN"
+    return None
+
+
+# ---------- verified addresses: organisations that help animals and accept donations in DOGE ----------
+# The explorer marks these addresses wherever they appear in a transaction, and lists them on /verified (and as JSON on /api/v1/verified-addresses).
+# Add an organisation only after checking the address on the organisation's own website (or its official channel) and writing that page down in "source":
+# anyone will send DOGE to what is listed here. An entry whose address is not a valid Dogecoin address is left out (the log says so).
+#
+#   {"address": "D...", "name": "Name of the organisation", "category": "Animal shelter",
+#    "about": "what it does for animals", "url": "https://its-own-website.example",
+#    "source": "https://its-own-website.example/donate (the page that publishes this address)", "verified": "2026-10-14",
+#    "streams": [{"title": "Packing line: vegan dog food", "url": "https://www.youtube.com/watch?v=VIDEO_ID"}]},      # "streams" is optional: a livestream of the organisation's own logistics
+# A stream link may be a YouTube video or channel, a Vimeo video, a Twitch channel or a direct https .m3u8 / .mp4 / .webm file; it only starts when the visitor presses play.
+VERIFIED_ADDRESSES = [
+]
+
+
+def valid_address(a):
+    n = 0
+    for ch in a:
+        i = B58.find(ch)
+        if i < 0:
+            return False
+        n = n * 58 + i
+    try:
+        raw = n.to_bytes(25, "big")
+    except OverflowError:
+        return False
+    return raw[0] in (0x1E, 0x16) and sha256d(raw[:21])[:4] == raw[21:]
+
+
+def stream_embed(url):
+    """(kind, src) to play a livestream link inside the page, or (None, url) when it can only be opened on its own site. Only https links."""
+    m = re.fullmatch(r"https://([a-z0-9.-]+)(/[^\s\"'<>]*)?", url, re.I)
+    if not m:
+        return None, ""
+    host, path = m.group(1).lower(), m.group(2) or "/"
+    host = host[4:] if host.startswith("www.") else host
+    q = dict(x.split("=", 1) for x in url.partition("?")[2].split("&") if "=" in x)
+    if host in ("youtube.com", "m.youtube.com", "youtu.be", "youtube-nocookie.com"):
+        vid = q.get("v") if path.startswith("/watch") else (path.split("/")[1] if host == "youtu.be" else (path.split("/")[2] if re.match(r"/(live|embed|shorts)/", path) else None))
+        if vid and re.fullmatch(r"[\w-]{6,20}", vid):
+            return "iframe", "https://www.youtube-nocookie.com/embed/" + vid + "?autoplay=1&rel=0"
+        c = re.match(r"/channel/(UC[\w-]{20,24})", path)
+        if c:
+            return "iframe", "https://www.youtube-nocookie.com/embed/live_stream?channel=" + c.group(1) + "&autoplay=1&rel=0"
+        return None, url
+    if host in ("vimeo.com", "player.vimeo.com"):
+        e = re.match(r"/event/(\d+)", path)
+        if e:
+            return "iframe", "https://vimeo.com/event/" + e.group(1) + "/embed?autoplay=1"
+        v = re.search(r"/(\d{5,12})(?:/|$)", path)
+        if v:
+            return "iframe", "https://player.vimeo.com/video/" + v.group(1) + "?autoplay=1"
+        return None, url
+    if host == "twitch.tv":
+        c = re.match(r"/([A-Za-z0-9_]{3,25})/?$", path)
+        if c:
+            return "iframe", "https://player.twitch.tv/?channel=" + c.group(1) + "&parent={host}&autoplay=true"
+        return None, url
+    if re.search(r"\.(m3u8|mp4|webm)$", path.partition("?")[0], re.I):
+        return "video", url
+    return None, url
+
+
+def load_streams(raw):
+    out = []
+    for x in (raw if isinstance(raw, list) else []):
+        u = str((x or {}).get("url", "")).strip()
+        kind, src = stream_embed(u)
+        if not u.lower().startswith("https://") or not src and not kind:
+            log("livestream skipped (needs a https link): " + u[:60])
+            continue
+        out.append({"title": str((x or {}).get("title") or "Livestream"), "url": u, "kind": kind or "link", "src": src if kind else u})
+    return out
+
+
+def load_verified(entries):
+    out = {}
+    for e in entries:
+        a = str(e.get("address", "")).strip()
+        if not valid_address(a) or not e.get("name"):
+            log("verified address skipped (not a valid Dogecoin address or no name): " + a[:40])
+            continue
+        out[a] = {"address": a, "name": str(e["name"]), "category": str(e.get("category") or "Animal welfare"), "about": str(e.get("about") or ""),
+                  "url": str(e.get("url") or ""), "source": str(e.get("source") or ""), "verified": str(e.get("verified") or ""),
+                  "streams": load_streams(e.get("streams"))}
+    return out
+
+
+VERIFIED = load_verified(VERIFIED_ADDRESSES)
+
+
+# ---------- who sends: the address behind an input, from the unlocking script itself (no txindex needed) ----------
+# A spend of a P2PKH output carries <signature> <public key>: hash160 of that key is the sender's address. A spend of a P2SH output ends with the
+# redeem script: hash160 of it is the P2SH address. (A pay-to-public-key spend carries only a signature, so its address needs the previous output.)
+
+def hash160(b):
+    try:
+        return hashlib.new("ripemd160", hashlib.sha256(b).digest()).digest()
+    except ValueError:  # no RIPEMD-160 in this OpenSSL build
+        return None
+
+
+def script_pushes(script):
+    out, i = [], 0
+    while i < len(script):
+        op = script[i]
+        i += 1
+        if op == 0:
+            out.append(b"")
+            continue
+        if op <= 75:
+            n = op
+        elif op in (0x4C, 0x4D, 0x4E):
+            ln = {0x4C: 1, 0x4D: 2, 0x4E: 4}[op]
+            if i + ln > len(script):
+                break
+            n = int.from_bytes(script[i:i + ln], "little")
+            i += ln
+        else:
+            continue
+        if i + n > len(script):
+            break
+        out.append(script[i:i + n])
+        i += n
+    return out
+
+
+def sender_address(script):
+    pushes = script_pushes(script)
+    if len(pushes) < 2:
+        return None
+    last, before = pushes[-1], pushes[-2]
+    if len(last) in (33, 65) and last[:1] in (b"\x02", b"\x03", b"\x04") and before[:1] == b"\x30":
+        h = hash160(last)
+        return b58check(0x1E, h) if h else None
+    if len(last) >= 3 and (before[:1] == b"\x30" or before == b""):
+        h = hash160(last)
+        return b58check(0x16, h) if h else None
+    return None
+
+
+# ---------- who mined it: the pool's tag in the coinbase (of the parent chain, for merge-mined blocks) ----------
+
+POOLS = [
+    ("ViaBTC", r"viabtc"), ("F2Pool", r"f2pool|七彩神仙鱼"), ("AntPool", r"antpool"), ("LitecoinPool.org", r"litecoinpool"),
+    ("Binance Pool", r"binance"), ("Poolin", r"poolin"), ("Trustpool", r"trustpool"), ("Mining-Dutch", r"mining-dutch"),
+    ("ZPool", r"zpool"), ("Prohashing", r"prohashing"), ("EMCDPool", r"emcd"), ("Unmineable", r"unmineable"),
+    ("Hashcity", r"hashcity"), ("K1Pool", r"k1pool"), ("NiceHash", r"nicehash"), ("DxPool", r"dxpool"),
+]
+
+
+def pool_name(block):
+    texts = []
+    for tx in (block["parent_coinbase"], block["txs"][0] if block["txs"] else None):
+        if tx and tx["vin"]:
+            texts.append(tx["vin"][0]["script"].decode("latin-1"))
+    text = " ".join(texts)
+    for name, pattern in POOLS:
+        if re.search(pattern, text, re.I):
+            return name
+    # drop the merged-mining commitment (fabe6d6d "mm" + 32-byte hash + size + nonce), then keep plain ASCII text only
+    text = re.sub("\xfa\xbemm.{40}", " ", text, flags=re.S)
+    tags = [t.strip("/ .-") for t in re.findall(r"[/A-Za-z0-9.\- ]{5,}", text)]
+    tags = [t for t in tags if len(re.findall(r"[A-Za-z]", t)) >= 3]
+    tag = max(tags, key=len) if tags else ""
+    return tag[:24] if len(tag) >= 4 else "Unknown"
+
+
+# ---------- blocks (cached) and the mempool ----------
+
+_blocks = {}
+_lock = threading.Lock()
+
+
+def block_by_hash(h):
+    with _lock:
+        if h in _blocks:
+            return _blocks[h]
+    info = rpc("getblock", h, True)
+    parsed = parse_block(rpc("getblock", h, False))
+    cb = parsed["txs"][0]
+    fees = max(0, sum(o["value"] for o in cb["vout"]) - SUBSIDY) if info["height"] >= 600_000 else 0
+    rest = max(1, info["size"] - 80 - cb["size"])
+    avg = fees / rest
+    b = {"hash": h, "height": info["height"], "time": info["time"], "size": info["size"], "nTx": len(parsed["txs"]),
+         "fees": fees, "avgFee": avg, "pool": pool_name(parsed), "txs": parsed["txs"], "prev": info.get("previousblockhash"),
+         "next": info.get("nextblockhash"), "difficulty": info.get("difficulty"), "confirmations": info.get("confirmations"),
+         "coinbaseHex": cb["vin"][0]["script"].hex()}
+    with _lock:
+        _blocks[h] = b
+        if len(_blocks) > 300:
+            for k in list(_blocks)[:100]:
+                del _blocks[k]
+    return b
+
+
+def last_blocks(n=10):
+    tip = rpc("getblockcount")
+    out = []
+    h = rpc("getblockhash", tip)
+    while h and len(out) < n:
+        b = block_by_hash(h)
+        out.append(b)
+        h = b["prev"]
+    return out
+
+
+def mempool_blocks():
+    pool = rpc("getrawmempool", True)
+    txs = sorted(((v["fee"] * COIN / max(1, v["size"]), v["size"], v["fee"] * COIN) for v in pool.values()), reverse=True)
+    blocks, cur, size = [], [], 0
+    for t in txs:
+        if size + t[1] > MAX_BLOCK and cur and len(blocks) < 7:
+            blocks.append((cur, size))
+            cur, size = [], 0
+        cur.append(t)
+        size += t[1]
+    if cur or not blocks:
+        blocks.append((cur, size))
+    out = []
+    for cur, size in blocks[:8]:
+        rates = sorted(t[0] for t in cur)
+        pick = lambda q: round(rates[min(len(rates) - 1, int(q * len(rates)))], 2) if rates else 0
+        out.append({"blockSize": size, "blockVSize": size, "nTx": len(cur), "totalFees": round(sum(t[2] for t in cur)),
+                    "medianFee": pick(0.5), "feeRange": [pick(0), pick(0.1), pick(0.25), pick(0.5), pick(0.75), pick(0.9), round(rates[-1], 2) if rates else 0]})
+    return out
+
+
+def mempool_top(n=8):
+    """the transactions that head the block being mined: best fee rate first (the site's Coinbase & Merkle Root animation hashes these)"""
+    pool = rpc("getrawmempool", True)
+    best = sorted(pool.items(), key=lambda kv: kv[1]["fee"] / max(1, kv[1]["size"]), reverse=True)[:n]
+    return {"height": int(rpc("getblockcount")) + 1, "nTx": len(pool),
+            "txs": [{"txid": k, "size": v["size"], "fee": round(v["fee"] * COIN)} for k, v in best]}
+
+
+def mempool_json(b):
+    """a block in mempool's /api/v1/blocks format"""
+    r = round(b["avgFee"], 2)
+    return {"id": b["hash"], "height": b["height"], "timestamp": b["time"], "tx_count": b["nTx"], "size": b["size"], "weight": b["size"] * 4,
+            "previousblockhash": b["prev"], "extras": {"medianFee": r, "feeRange": [r, r], "totalFees": b["fees"], "reward": b["fees"] + SUBSIDY,
+                                                      "pool": {"name": b["pool"]}, "coinbaseRaw": b["coinbaseHex"]}}
+
+
+PERIOD_BLOCKS = 1440          # Dogecoin sets its difficulty at every block (DigiShield): the blockchain on hashes.space goes back a day, the window the pool pages use
+
+
+def period_blocks(frm, limit=15, budget=8.0):
+    """up to `limit` blocks from height `frm` downward, never further back than PERIOD_BLOCKS from the tip, in mempool's block format"""
+    tip = int(rpc("getblockcount"))
+    start = max(1, tip - PERIOD_BLOCKS + 1)
+    deadline, out, h = time.time() + budget, [], min(frm, tip)
+    while h >= start and len(out) < limit and (not out or time.time() < deadline):
+        try:
+            v = mempool_json(block_by_hash(rpc("getblockhash", h)))
+            v.pop("previousblockhash", None)
+            out.append(v)
+        except Exception:  # noqa: BLE001
+            pass
+        h -= 1
+    return {"tip": tip, "periodStart": start, "blocks": out}
+
+
+# ---------- the next block: when it is expected ----------
+# Blocks are found by chance (every hash is an independent try), so no node can know the moment; the average wait is what can be worked out, and the
+# better the pace of the miners is known, the better that average is. It is estimated from several things together:
+#   1. the real pace of the miners: the hashes the last blocks took, over the time they took, the newest counting most (the weight halves every NEXT_HALF blocks)
+#      and the block timestamps taken end to end, so one block with a wrong clock does no harm
+#   2. the difficulty of the block that is being mined now (not the last one's): at a Bitcoin retarget it follows from the period's pace, on a chain that
+#      retargets every block it is the node's own number for the next block
+#   3. the chain's target, as a limit: an average outside a tenth to ten times the target is not believed
+# The block that comes next takes `w_next` hashes at that pace, so the average wait is w_next / pace. The error of the pace shrinks with the blocks that count.
+def next_block_estimate(blocks, w_next, half):
+    """blocks: [(time, hashes the block took)], oldest first. Returns (average wait in seconds, relative error, blocks that count) or None."""
+    num = den = wsum = w2 = 0.0
+    n = len(blocks)
+    for j in range(1, n):
+        wt = 0.5 ** ((n - 1 - j) / half)
+        num += wt * blocks[j][1]
+        den += wt * (blocks[j][0] - blocks[j - 1][0])
+        wsum += wt
+        w2 += wt * wt
+    if num <= 0 or den <= 0 or w_next <= 0:
+        return None
+    n_eff = wsum * wsum / w2 if w2 else 0.0
+    return w_next / (num / den), (1 / math.sqrt(n_eff) if n_eff > 0 else 1.0), n_eff
+
+
+def next_block_answer(chain, tip, last_time, mean, err, n_eff, window, target, change, retarget):
+    mean = max(target / 10.0, min(target * 10.0, mean))
+    return {"chain": chain, "tip": tip, "lastBlockTime": last_time, "targetSeconds": target, "meanSeconds": round(mean, 1),
+            "medianSeconds": round(mean * 0.6931, 1), "relativeError": round(err, 3), "blocksCounted": int(n_eff), "windowBlocks": window,
+            "nextDifficultyChange": round(change, 2), "retargetNext": retarget, "updated": int(time.time())}
+
+
+
+NEXT_WINDOW, NEXT_HALF, TARGET_SECONDS = 480, 120.0, 60       # eight hours of blocks looked at; the weight of a block halves every 120 blocks
+_next_heads = {}                                              # height -> (time, difficulty, bits)
+_next = {"at": 0.0, "data": None}
+_next_lock = threading.Lock()
+
+
+def bits_target(bits):
+    return int(bits[2:], 16) * 256 ** (int(bits[:2], 16) - 3)
+
+
+def next_block():
+    with _next_lock:
+        if _next["data"] and time.time() - _next["at"] < 15:
+            return _next["data"]
+        tip = int(rpc("getblockcount"))
+        first = max(1, tip - NEXT_WINDOW + 1)
+        todo = [h for h in range(first, tip + 1) if h not in _next_heads]
+        for i in range(0, len(todo), 250):
+            chunk = todo[i:i + 250]
+            hashes = rpc_batch([("getblockhash", [h]) for h in chunk])
+            heads = rpc_batch([("getblockheader", [bh]) for bh in hashes if bh])
+            for hd in heads:
+                if hd:
+                    _next_heads[hd["height"]] = (int(hd["time"]), float(hd["difficulty"]), hd["bits"])
+        for h in [h for h in _next_heads if h < first]:
+            del _next_heads[h]
+        rows = [_next_heads[h] for h in range(first, tip + 1) if h in _next_heads]
+        if len(rows) < 10:
+            raise RuntimeError("not enough blocks to tell")
+        blocks = [(r[0], r[1]) for r in rows]
+        w_tip = w_next = rows[-1][1]
+        try:             # DigiShield sets the next difficulty from the last blocks: the node's own template names it (its bits)
+            nb = rpc("getblocktemplate", {}, timeout=10)["bits"]
+            w_next = w_tip * bits_target(rows[-1][2]) / bits_target(nb)
+        except Exception:  # noqa: BLE001
+            pass
+        est = next_block_estimate(blocks, w_next, NEXT_HALF)
+        if not est:
+            raise RuntimeError("not enough blocks to tell")
+        out = next_block_answer("dogecoin", tip, rows[-1][0], est[0], est[1], est[2], len(blocks), TARGET_SECONDS, (w_next / w_tip - 1) * 100, False)
+        _next["at"], _next["data"] = time.time(), out
+        return out
+
+
+# ---------- mining statistics from your own node (mempool's /api/v1/mining format) ----------
+
+DAY, WEEK, YEAR_DAYS = 1440, 10080, 365  # Dogecoin: a block a minute
+_pool_by_height = {}
+_mining = {"hashrate": {}, "pools": {}, "pool-hashrate": {}, "solo": {}, "at": 0}
+# the periods the page offers: blocks in the period, and one hashrate point per STEP blocks (a block a minute)
+RANGES = {"24h": (1440, 60), "14d": (20160, 360), "1m": (43200, 720), "6m": (259200, 1440), "1y": (525600, 1440)}
+SAMPLE = 2500   # a long period reads about this many blocks for its pool shares (an estimate), a short one reads them all
+
+
+def pool_from_header(header_hex):
+    """the pool tag, from a block header: merge-mined headers carry the parent chain's coinbase (AuxPoW)"""
+    r = Reader(bytes.fromhex(header_hex))
+    version = r.i32()
+    r.take(76)
+    if version & 0x100 and r.i < len(r.d):
+        return pool_name({"parent_coinbase": read_tx(r), "txs": []})
+    return None
+
+
+def pools_last_week(tip):
+    first = max(0, tip - WEEK + 1)
+    todo = [h for h in range(first, tip + 1) if h not in _pool_by_height]
+    for i in range(0, len(todo), 250):
+        chunk = todo[i:i + 250]
+        pairs = [(h, bh) for h, bh in zip(chunk, rpc_batch([("getblockhash", [h]) for h in chunk])) if bh]
+        headers = rpc_batch([("getblockheader", [bh, False]) for _, bh in pairs])
+        for (h, bh), hx in zip(pairs, headers):
+            name = None
+            try:
+                name = pool_from_header(hx) if hx else None
+                if name is None:  # not merge-mined: the pool tag is in the block's own coinbase
+                    name = pool_name(parse_block(rpc("getblock", bh, False)))
+            except (ValueError, RpcError, KeyError, IndexError):
+                name = "Unknown"
+            _pool_by_height[h] = name
+    for h in [h for h in _pool_by_height if h < first]:
+        del _pool_by_height[h]
+    counts = {}
+    for h in range(first, tip + 1):
+        if h in _pool_by_height:
+            counts[_pool_by_height[h]] = counts.get(_pool_by_height[h], 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    total = sum(counts.values())
+    return {"pools": [{"poolId": i + 1, "name": n, "slug": re.sub(r"[^a-z0-9]", "", n.lower()), "rank": i + 1, "blockCount": c, "emptyBlocks": 0}
+                      for i, (n, c) in enumerate(ranked)],
+            "blockCount": total, "lastEstimatedHashrate": rpc("getnetworkhashps", DAY)}
+
+
+def pools_range(tip, rng):
+    """the pool shares of one period: every block of a short one, an evenly spread sample of a long one (scaled up)"""
+    blocks = RANGES[rng][0]
+    first = max(1, tip - blocks + 1)
+    stride = max(1, blocks // SAMPLE)
+    heights = [h for h in range(first, tip + 1) if h % stride == 0]
+    todo = [h for h in heights if h not in _pool_by_height]
+    for i in range(0, len(todo), 250):
+        chunk = todo[i:i + 250]
+        pairs = [(h, bh) for h, bh in zip(chunk, rpc_batch([("getblockhash", [h]) for h in chunk])) if bh]
+        headers = rpc_batch([("getblockheader", [bh, False]) for _, bh in pairs])
+        for (h, bh), hx in zip(pairs, headers):
+            name = None
+            try:
+                name = pool_from_header(hx) if hx else None
+                if name is None:
+                    name = pool_name(parse_block(rpc("getblock", bh, False)))
+            except (ValueError, RpcError, KeyError, IndexError):
+                name = "Unknown"
+            _pool_by_height[h] = name
+    counts = {}
+    for h in heights:
+        if h in _pool_by_height:
+            counts[_pool_by_height[h]] = counts.get(_pool_by_height[h], 0) + 1
+    seen = sum(counts.values()) or 1
+    scale = (tip - first + 1) / seen          # 1 when every block was read
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    return {"pools": [{"poolId": i + 1, "name": n, "slug": re.sub(r"[^a-z0-9]", "", n.lower()), "rank": i + 1, "blockCount": max(1, round(c * scale)), "emptyBlocks": 0}
+                      for i, (n, c) in enumerate(ranked)],
+            "blockCount": tip - first + 1, "sampled": stride > 1, "lastEstimatedHashrate": rpc("getnetworkhashps", DAY)}
+
+
+_pool_block_cache = {}
+_pool_fill_lock = threading.Lock()
+_pool_warm_lock = threading.Lock()
+
+
+def _fill_pool_cache(heights):
+    """read the blocks of these heights into the cache, 50 at a time (one at a time overall)"""
+    if not _pool_fill_lock.acquire(blocking=False):
+        return
+    try:
+        todo = [h for h in heights if h not in _pool_block_cache]
+        for i in range(0, len(todo), 50):
+            chunk = todo[i:i + 50]
+            try:
+                hashes = rpc_batch([("getblockhash", [h]) for h in chunk])
+                blocks = rpc_batch([("getblock", [bh, True]) for bh in hashes if bh])
+            except Exception as exc:  # noqa: BLE001
+                log("pool blocks: " + str(exc))
+                continue
+            by_hash = {b["hash"]: b for b in blocks if b}
+            for h, bh in zip(chunk, hashes):
+                b = by_hash.get(bh)
+                if b:
+                    _pool_block_cache[h] = {"id": bh, "height": h, "timestamp": b["time"], "tx_count": len(b["tx"]), "size": b["size"], "weight": b["size"] * 4,
+                                            "previousblockhash": b.get("previousblockhash")}
+            if not by_hash:
+                log("pool blocks: the node returned no block for heights " + str(chunk[0]) + "-" + str(chunk[-1]))
+    finally:
+        _pool_fill_lock.release()
+
+
+def pool_blocks(slug):
+    """the blocks one pool mined in the last 1,440 blocks (a day), newest first, in mempool's /api/v1/blocks format: the pool page on hashes.space draws them.
+    The blocks are read in the background; what is ready is answered at once (the page asks again while the list grows)"""
+    tip = int(rpc("getblockcount"))
+    first = tip - DAY + 1
+    if sum(1 for h in range(first, tip + 1) if h in _pool_by_height) < DAY // 2 and _pool_warm_lock.acquire(blocking=False):     # cold start: read the pool tags of the day now
+        def warm():
+            try:
+                pools_range(tip, "24h")
+            except Exception as exc:  # noqa: BLE001
+                log("pool tags: " + str(exc))
+            finally:
+                _pool_warm_lock.release()
+        threading.Thread(target=warm, daemon=True).start()
+    heights = sorted((h for h, n in list(_pool_by_height.items()) if h >= first and re.sub(r"[^a-z0-9]", "", n.lower()) == slug), reverse=True)[:600]
+    if any(h not in _pool_block_cache for h in heights):
+        t = threading.Thread(target=_fill_pool_cache, args=(heights,), daemon=True)
+        t.start()
+        t.join(5)
+    for h in [h for h in list(_pool_block_cache) if h < first]:
+        _pool_block_cache.pop(h, None)
+    return [dict(_pool_block_cache[h], extras={"pool": {"name": _pool_by_height[h]}}) for h in heights if h in _pool_block_cache]
+
+
+def hashrate_range(tip, rng):
+    blocks, step = RANGES[rng]
+    n = blocks // step
+    heights = [tip - d * step for d in range(n) if tip - d * step > step][::-1]
+    hashes = rpc_batch([("getblockhash", [h]) for h in heights])
+    headers = rpc_batch([("getblockheader", [bh]) for bh in hashes if bh])
+    rates = rpc_batch([("getnetworkhashps", [step, h]) for h in heights])
+    by_height = {hd["height"]: hd for hd in headers if hd}
+    points, diffs, prev = [], [], None
+    for h, rate in zip(heights, rates):
+        hd = by_height.get(h)
+        if not hd or rate is None:
+            continue
+        points.append({"timestamp": hd["time"], "avgHashrate": rate})
+        d = hd["difficulty"]
+        diffs.append({"time": hd["time"], "height": h, "difficulty": d, "adjustment": (d / prev) if prev else 1})
+        prev = d
+    return {"hashrates": points, "difficulty": diffs, "currentHashrate": rpc("getnetworkhashps", WEEK), "currentDifficulty": rpc("getdifficulty")}
+
+
+def pool_hashrate_range(tip, rng, hr):
+    """the hashrate of the pools together: the network's hashrate at each point times the share of the blocks around it that pools mined
+    (the blocks read for the pool shares: all of them for a short period, an evenly spread sample for a long one)"""
+    blocks, step = RANGES[rng]
+    first = max(1, tip - blocks + 1)
+    stride = max(1, blocks // SAMPLE)
+    reach = max(step, blocks // 52)                 # each point looks back over about a fiftieth of the period
+    sample = {h: _pool_by_height[h] for h in range(first, tip + 1) if h % stride == 0 and h in _pool_by_height}
+    at = {d["time"]: d["height"] for d in hr["difficulty"]}
+    points = []
+    for pt in hr["hashrates"]:
+        h = at.get(pt["timestamp"])
+        if h is None:
+            continue
+        names = [n for k, n in sample.items() if h - reach < k <= h]
+        if names:
+            share = sum(1 for n in names if n != "Unknown") / len(names)
+            points.append({"timestamp": pt["timestamp"], "avgHashrate": pt["avgHashrate"] * share, "share": share, "networkHashrate": pt["avgHashrate"]})
+    if not points:
+        raise RuntimeError("no data yet")
+    names = [n for k, n in sample.items() if k > tip - max(step, WEEK)]
+    now = sum(1 for n in names if n != "Unknown") / len(names) if names else points[-1]["share"]
+    return {"currentHashrate": hr["currentHashrate"] * now, "currentShare": now, "networkHashrate": hr["currentHashrate"], "complete": True,
+            "sampled": stride > 1, "hashrates": points}
+
+
+def solo_range(pools, hr):
+    """the hashrate of miners without a pool: the blocks whose coinbase names none of the known pools (a solo miner's own tag, or no tag at all)
+    plus any name that says solo, times the network's hashrate. An upper bound: a pool missing from the list lands here too."""
+    known = {n for n, _ in POOLS}
+    total = max(1, pools["blockCount"])
+    sources, other = [], 0
+    for e in pools["pools"]:
+        if e["name"] in known:
+            continue
+        if re.search("solo", e["name"], re.I):
+            sources.append({"name": e["name"], "kind": "service", "blockCount": e["blockCount"]})
+        else:
+            other += e["blockCount"]
+    if other:
+        sources.append({"name": "No known pool in the coinbase", "kind": "unattributed", "blockCount": other})
+    rate = hr["currentHashrate"]
+    for x in sources:
+        x["share"] = x["blockCount"] / total
+        x["hashrate"] = rate * x["share"]
+    blocks = sum(x["blockCount"] for x in sources)
+    return {"window": None, "blockCount": pools["blockCount"], "soloBlocks": blocks, "share": blocks / total, "currentHashrate": rate * blocks / total,
+            "networkHashrate": rate, "sampled": bool(pools.get("sampled")), "sources": sources}
+
+
+def hashrate_year(tip):
+    heights = [tip - d * DAY for d in range(YEAR_DAYS) if tip - d * DAY > DAY][::-1]
+    hashes = rpc_batch([("getblockhash", [h]) for h in heights])
+    headers = rpc_batch([("getblockheader", [bh]) for bh in hashes if bh])
+    rates = rpc_batch([("getnetworkhashps", [DAY, h]) for h in heights])
+    by_height = {hd["height"]: hd for hd in headers if hd}
+    points, diffs, prev = [], [], None
+    for h, rate in zip(heights, rates):
+        hd = by_height.get(h)
+        if not hd or rate is None:
+            continue
+        points.append({"timestamp": hd["time"], "avgHashrate": rate})
+        d = hd["difficulty"]
+        diffs.append({"time": hd["time"], "height": h, "difficulty": d, "adjustment": (d / prev) if prev else 1})
+        prev = d
+    return {"hashrates": points, "difficulty": diffs, "currentHashrate": rpc("getnetworkhashps", WEEK), "currentDifficulty": rpc("getdifficulty")}
+
+
+# ---------- DigiShield: the hashrate of every block ----------
+# Dogecoin retargets its difficulty at EVERY block (DigiShield, aiming at a minute per block), so there is no difficulty period to count blocks in.
+# A block's difficulty says how many hashes it took: difficulty * 2^32, over the 60 s the retarget aims at: that is the hashrate of the block.
+# The window is the last DIGI_BLOCKS blocks. The median of their hashrates is the network's per-block hashrate; a source's hashrate is its share
+# of the window's blocks times that median (one lucky hour does not move it). The chart is the same, in slices of DIGI_SLICE blocks.
+DIGI_BLOCKS, DIGI_SLICE, DIGI_TARGET = 1440, 30, 60
+_diff_by_height = {}
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    return 0 if not n else xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def digishield(tip):
+    first = max(1, tip - DIGI_BLOCKS + 1)
+    pools_range(tip, "24h")                       # makes sure every block of the window has its pool tag
+    todo = [h for h in range(first, tip + 1) if h not in _diff_by_height]
+    for i in range(0, len(todo), 250):
+        chunk = todo[i:i + 250]
+        pairs = [(h, bh) for h, bh in zip(chunk, rpc_batch([("getblockhash", [h]) for h in chunk])) if bh]
+        for (h, _), hd in zip(pairs, rpc_batch([("getblockheader", [bh]) for _, bh in pairs])):
+            if hd:
+                _diff_by_height[h] = (hd["difficulty"], hd["time"])
+    for h in [h for h in _diff_by_height if h < first]:
+        del _diff_by_height[h]
+    heights = [h for h in range(first, tip + 1) if h in _diff_by_height and h in _pool_by_height]
+    if len(heights) < DIGI_SLICE:
+        raise RuntimeError("no data yet")
+    known = {n for n, _ in POOLS}
+
+    def kind(name):                               # a known pool, a solo service, or a tag no known pool owns
+        return "pool" if name in known else "service" if re.search("solo", name, re.I) else "unattributed"
+    rate = {h: _diff_by_height[h][0] * 2 ** 32 / DIGI_TARGET for h in heights}      # the hashrate of every block
+    med = _median(rate.values())
+    blocks = len(heights)
+    names = {}
+    for h in heights:
+        names[_pool_by_height[h]] = names.get(_pool_by_height[h], 0) + 1
+    pool_list, sources, other, pool_blocks = [], [], 0, 0
+    for i, (n, c) in enumerate(sorted(names.items(), key=lambda kv: -kv[1])):
+        k = kind(n)
+        pool_list.append({"poolId": i + 1, "name": n, "slug": re.sub(r"[^a-z0-9]", "", n.lower()), "rank": i + 1, "blockCount": c, "emptyBlocks": 0, "hashrate": med * c / blocks})
+        if k == "service":
+            sources.append({"name": n, "kind": "service", "blockCount": c, "share": c / blocks, "hashrate": med * c / blocks})
+        elif k == "unattributed":
+            other += c
+        else:
+            pool_blocks += c
+    if other:
+        sources.append({"name": "No known pool in the coinbase", "kind": "unattributed", "blockCount": other, "share": other / blocks, "hashrate": med * other / blocks})
+    solo_blocks = sum(x["blockCount"] for x in sources)
+    # the chart: slices of blocks, each with the mean hashrate of its blocks and the share the pools mined
+    slices = [heights[i:i + DIGI_SLICE] for i in range(0, len(heights), DIGI_SLICE)]
+    slices = [sl for sl in slices if len(sl) >= DIGI_SLICE // 2]
+    stamps = [_diff_by_height[sl[-1]][1] for sl in slices]
+    net = [sum(rate[h] for h in sl) / len(sl) for sl in slices]
+    shares = [sum(1 for h in sl if kind(_pool_by_height[h]) == "pool") / len(sl) for sl in slices]
+    base = {"window": "blocks", "perBlock": True, "retarget": "DigiShield", "blockCount": blocks, "sliceBlocks": DIGI_SLICE, "slices": len(slices), "sinceBlock": heights[0], "tipBlock": heights[-1]}
+    hashrate = {"hashrates": [{"timestamp": t, "avgHashrate": r} for t, r in zip(stamps, net)],
+                "difficulty": [{"time": t, "height": sl[-1], "difficulty": _diff_by_height[sl[-1]][0],
+                                "adjustment": (_diff_by_height[sl[-1]][0] / _diff_by_height[slices[j - 1][-1]][0]) if j else 1} for j, (t, sl) in enumerate(zip(stamps, slices))],
+                "currentHashrate": med, "currentDifficulty": rpc("getdifficulty"), **base}
+    pools = {"pools": pool_list, "sampled": False, "lastEstimatedHashrate": med, **base}
+    pool_hr = {"currentHashrate": med * pool_blocks / blocks, "currentShare": pool_blocks / blocks, "networkHashrate": med, "complete": True, "sampled": False,
+               "hashrates": [{"timestamp": t, "avgHashrate": r * s, "share": s, "networkHashrate": r} for t, r, s in zip(stamps, net, shares)], **base}
+    solo = {"soloBlocks": solo_blocks, "share": solo_blocks / blocks, "currentHashrate": med * solo_blocks / blocks, "networkHashrate": med, "sampled": False, "sources": sources, **base}
+    return hashrate, pools, pool_hr, solo
+
+
+def mining_stats():
+    """recomputed every 10 minutes in the background (the first run reads a week of block headers)"""
+    while True:
+        try:
+            tip = rpc("getblockcount")
+            _mining["pools"]["24h"] = pools_range(tip, "24h")        # the last day first: the pool profiles on hashes.space list a pool's blocks of the day
+            _mining["pools"]["1w"] = pools_last_week(tip)
+            _mining["hashrate"]["1y"] = hashrate_year(tip)
+            _mining["at"] = time.time()
+            (_mining["hashrate"]["blocks"], _mining["pools"]["blocks"], _mining["pool-hashrate"]["blocks"], _mining["solo"]["blocks"]) = digishield(tip)
+            for rng in RANGES:          # the other periods follow, one by one (the long ones read more blocks)
+                _mining["hashrate"][rng] = hashrate_range(tip, rng)
+                _mining["pools"][rng] = pools_range(tip, rng)
+                _mining["pool-hashrate"][rng] = pool_hashrate_range(tip, rng, _mining["hashrate"][rng])
+                _mining["solo"][rng] = dict(solo_range(_mining["pools"][rng], _mining["hashrate"][rng]), window=rng)
+        except Exception as exc:  # noqa: BLE001
+            log("mining stats: " + str(exc))
+        time.sleep(600)
+
+
+# ---------- WebSocket (mempool protocol) ----------
+
+_clients = set()
+_clients_lock = threading.Lock()
+_state = {"tip": None, "mempool": [], "mempool_json": ""}
+_send_lock = threading.Lock()
+
+
+def ws_send(sock, text):
+    data = text.encode()
+    head = bytearray([0x81])
+    if len(data) < 126:
+        head.append(len(data))
+    elif len(data) < 65536:
+        head += bytes([126]) + struct.pack(">H", len(data))
+    else:
+        head += bytes([127]) + struct.pack(">Q", len(data))
+    with _send_lock:
+        sock.sendall(bytes(head) + data)
+
+
+def broadcast(obj):
+    text = json.dumps(obj)
+    with _clients_lock:
+        dead = []
+        for c in _clients:
+            try:
+                ws_send(c, text)
+            except OSError:
+                dead.append(c)
+        for c in dead:
+            _clients.discard(c)
+
+
+def poller():
+    while True:
+        try:
+            tip = rpc("getbestblockhash")
+            if tip != _state["tip"]:
+                first = _state["tip"] is None
+                _state["tip"] = tip
+                if not first:
+                    broadcast({"block": mempool_json(block_by_hash(tip))})
+            mp = mempool_blocks()
+            text = json.dumps(mp)
+            if text != _state["mempool_json"]:
+                _state["mempool"], _state["mempool_json"] = mp, text
+                broadcast({"mempool-blocks": mp})
+        except Exception as exc:  # noqa: BLE001
+            log("poll: " + str(exc))
+        time.sleep(6)
+
+
+# ---------- HTML ----------
+
+CSS = """
+:root{color-scheme:dark;--bg:#11131f;--surface:#1d1f31;--line:#2d3348;--text:#fff;--muted:#9ea4bc;--link:#1bd8f4;--gold:#c2a633}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:400 14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line)}
+header .hlink{font-size:13px;color:#3ce26b;white-space:nowrap}.subnav{display:flex;flex-wrap:wrap;gap:8px;max-width:1100px;margin:0 auto;padding:10px 16px 0}.subnav a{border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);border-radius:999px;padding:5px 14px;font-size:13px;color:var(--muted);white-space:nowrap}.subnav a:hover{text-decoration:none;color:var(--text)}.subnav a.here{color:var(--gold);border-color:var(--gold)}.subnav a.ver{color:#3ce26b;border-color:rgba(60,226,107,.45)}.subnav a.ver[aria-current]{background:rgba(60,226,107,.12)}header .brand{font:700 18px/1 system-ui;color:var(--text)}header .brand span{color:var(--gold)}
+form{display:flex;gap:8px;flex:1;max-width:560px}input{flex:1;min-width:0;background:#0b0d17;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:9px 12px;font:13px ui-monospace,Menlo,monospace}
+button{background:var(--gold);color:#1a1406;border:0;border-radius:8px;padding:0 14px;font-weight:600;cursor:pointer}
+main{max-width:1100px;margin:0 auto;padding:20px 16px 48px;display:grid;gap:18px}
+h1{font:600 20px/1.3 system-ui;margin:0}h2{font:600 15px/1.3 system-ui;margin:0 0 8px;color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px;overflow-x:auto}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:500;font-size:12.5px}
+td.r,th.r{text-align:right}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}.muted{color:var(--muted)}.wrap{white-space:normal;word-break:break-all}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
+.bhero{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}.bhero h1{font-size:24px}.bhero .navbtns{margin-left:auto;display:flex;gap:8px}.navbtns a{border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:6px 12px;font-size:13px;color:var(--text)}.navbtns a:hover{border-color:var(--gold);text-decoration:none}.navbtns span.off{border:1px solid var(--line);border-radius:8px;padding:6px 12px;font-size:13px;color:var(--muted);opacity:.5}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;background:#0b0d17;border:1px solid var(--line);font-size:12.5px;color:var(--muted)}.chip b{color:var(--gold);font-weight:600}
+.bhash{display:grid;gap:8px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:12px;padding:14px 18px}.bhtop{display:flex;align-items:center;justify-content:space-between;gap:12px}.bhash small{color:var(--gold);font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase}
+.bhash .bhv{word-break:break-all;font-size:clamp(15px,2.3vw,23px);font-weight:600;line-height:1.35;color:#fff;letter-spacing:.01em}.bhn{color:var(--muted);font-size:13px}
+.bhcopy{background:#0b0d17;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 12px;font:500 12px/1.4 system-ui;cursor:pointer}.bhcopy:hover{color:#fff;border-color:var(--gold)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.tiles.wide{grid-template-columns:repeat(3,1fr)}@media(max-width:780px){.tiles.wide{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.tiles.wide{grid-template-columns:1fr}}.tile{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:grid;gap:3px;align-content:start;min-width:0}.tile small{color:var(--muted);font-size:12px;letter-spacing:.06em;text-transform:uppercase}.tile b{font:600 20px/1.2 ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.tile em{font-style:normal;color:var(--muted);font-size:12.5px}.tile .meter{height:6px;border-radius:3px;background:#0b0d17;border:1px solid var(--line);overflow:hidden;margin-top:4px}.tile .meter i{display:block;height:100%;background:var(--gold)}
+.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));gap:14px}.groups .card h2{margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--line)}.groups dl{grid-template-columns:minmax(96px,max-content) 1fr;gap:8px 16px}.groups dd{min-width:0}
+.pay{display:grid;grid-template-columns:1fr auto 52px;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line)}.pay:last-child{border-bottom:0}.pay .mono{min-width:0;word-break:break-all}.pamt{font:600 13px ui-monospace,Menlo,monospace;white-space:nowrap}.pamt small{color:var(--muted);font-weight:500}.ppct{color:var(--muted);font-size:12.5px;text-align:right}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.stat b{display:block;font:600 20px/1.2 ui-monospace,Menlo,monospace}
+.err{color:#ff6b6b}footer{color:var(--muted);font-size:12px;text-align:center;padding:0 16px 24px}
+"""
+
+
+PAGES_CSS = """
+.lead{margin:0 0 10px;font-size:15px}.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,200px),1fr));gap:10px}.step{background:#0b0d17;border:1px solid var(--line);border-radius:10px;padding:9px 12px;color:var(--muted);font-size:13px}.step b{color:var(--text)}.step .n{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--gold);color:#1a1406;font-weight:700;font-size:11px;margin-right:8px}
+.eg1{margin:10px 0 0;color:var(--muted);font-size:13px}.eg1 b{color:var(--link)}
+.legend{margin:0 0 8px;color:var(--muted);font-size:12.5px}.legend span{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 12px;vertical-align:-1px}.legend .k1{background:var(--link);margin-left:0}.legend .k2{background:#5d6280}
+.rank td.bar{width:46%;min-width:150px}.rank .bar div{display:flex;align-items:center;gap:10px}.rank .bar span{display:block;height:10px;border-radius:2px;background:#5d6280;flex:none}.rank tr.in .bar span{background:var(--link)}.rank .bar b{font-size:15px}.rank td.n{color:var(--muted)}.rank tr.out{opacity:.7}
+.rank tr.cut td,.rank tr.gap td{padding:12px 0;text-align:center;border-bottom:0;background:linear-gradient(var(--line),var(--line)) center/100% 1px no-repeat}.rank tr.cut td span,.rank tr.gap td span{display:inline-block;padding:3px 14px;border-radius:999px;background:var(--surface);border:1px solid var(--line);color:var(--muted);font-size:12.5px;white-space:normal}
+.rank tr.cut td{background-image:linear-gradient(rgba(194,166,51,.45),rgba(194,166,51,.45))}.rank tr.cut td span{border-color:rgba(194,166,51,.55);color:var(--gold);background:#2a2230}
+.finder{display:flex;gap:8px;max-width:none;margin:0 0 10px}.finder input{font-size:13.5px}.hit{display:flex;gap:14px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:0 0 12px;background:#0b0d17}.hit.in{border-color:var(--link)}.hit.out{border-color:#5d6280}.hit.miss{color:var(--muted);display:block}.hit .hn{font:700 22px/1 system-ui;min-width:56px;color:var(--text)}.hit.in .hn{color:var(--link)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2fb585;box-shadow:0 0 0 0 rgba(47,181,133,.6);animation:pulse 2s infinite}@keyframes pulse{70%{box-shadow:0 0 0 7px rgba(47,181,133,0)}100%{box-shadow:0 0 0 0 rgba(47,181,133,0)}}@media(prefers-reduced-motion:reduce){.dot{animation:none}}
+.bsz{display:block;width:100%;min-width:560px;height:auto}#chart{overflow-x:auto}.bsz .ax{stroke:var(--line);stroke-width:1}.bsz rect{fill:#7a6cd6}.bsz .med{stroke:var(--link);stroke-width:2}.bsz .lim{stroke:#d9a21b;stroke-width:2;stroke-dasharray:7 5}.bsz .tk{fill:var(--muted);font:12px system-ui;text-anchor:end}
+.legend .k3{background:#7a6cd6}.legend .k4{background:#d9a21b}
+.penwrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:24px;align-items:center}@media(max-width:820px){.penwrap{grid-template-columns:1fr}}
+.card.main{border-color:#3a3f5c;box-shadow:0 0 0 1px rgba(194,166,51,.18),0 10px 30px rgba(0,0,0,.25)}.card.main h2{font-size:17px;color:var(--text)}
+.pen{display:block;width:100%;height:auto;background:#0b0d17;border:1px solid var(--line);border-radius:12px}.pen .ax{stroke:var(--line);fill:none;stroke-width:1}.pen .curve{fill:none;stroke:#ff8a80;stroke-width:2.5}.pen #mk{fill:#fff;stroke:#ff8a80;stroke-width:2.5}.pen .tk2{fill:var(--muted);font:8.5px system-ui}
+.bigrow{display:flex;flex-wrap:wrap;gap:14px 24px;align-items:flex-end;justify-content:space-between}.big{font:700 38px/1 system-ui;letter-spacing:-.02em}.bigq{color:var(--muted);font-size:13px;margin-top:4px}
+.keptbox{min-width:180px;flex:1;max-width:260px}.keptbox small{display:block;color:var(--muted);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase}.keptbox b{font:700 28px/1.1 system-ui}.keptbox b.ok{color:#2fb585}.keptbox b.warn{color:#f2b04a}.keptbox b.bad{color:#ff6b5e}.keptbox em{display:block;font-style:normal;color:var(--muted);font-size:12px;margin-top:3px}
+.mtr{height:8px;border-radius:99px;background:#0b0d17;border:1px solid var(--line);overflow:hidden;margin-top:6px}.mtr i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#ff6b5e,#f2b04a 50%,#2fb585);background-size:260px 100%;border-radius:99px;transition:width .15s}
+.slwrap{position:relative;margin:34px 0 4px}.bub{position:absolute;top:-30px;transform:translateX(-50%);background:var(--gold);color:#1a1406;font:700 12px/1 system-ui;padding:5px 9px;border-radius:7px;white-space:nowrap;pointer-events:none}.bub::after{content:'';position:absolute;left:50%;bottom:-4px;width:8px;height:8px;background:var(--gold);transform:translateX(-50%) rotate(45deg);border-radius:1px}
+.poolmk{position:absolute;top:30px;width:2px;height:10px;background:var(--link);transform:translateX(-1px);border-radius:1px;pointer-events:none}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:26px;background:transparent;padding:0;margin:0;cursor:pointer;--p:0%}
+input[type=range]::-webkit-slider-runnable-track{height:10px;border-radius:99px;background:linear-gradient(90deg,#2fb585,#f2b04a 55%,#ff6b5e);box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)}
+input[type=range]::-moz-range-track{height:10px;border-radius:99px;background:linear-gradient(90deg,#2fb585,#f2b04a 55%,#ff6b5e);box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;margin-top:-8px;border-radius:50%;background:#fff;border:4px solid var(--gold);box-shadow:0 2px 8px rgba(0,0,0,.5);transition:transform .1s}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:4px solid var(--gold);box-shadow:0 2px 8px rgba(0,0,0,.5)}
+input[type=range]:hover::-webkit-slider-thumb,input[type=range]:active::-webkit-slider-thumb{transform:scale(1.1)}input[type=range]:focus-visible{outline:2px solid var(--link);outline-offset:6px;border-radius:99px}
+.ticks{display:flex;justify-content:space-between;color:var(--muted);font-size:11.5px;margin-top:2px}
+.presets{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.presets button{background:#0b0d17;color:var(--text);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font:500 12.5px system-ui;cursor:pointer}.presets button:hover{border-color:var(--gold);color:var(--gold)}.presets button#poolbtn{border-color:var(--link);color:var(--link)}
+.formula{margin:14px 0 0;color:var(--muted);font-size:13px}.formula span{color:var(--text);font-weight:600;font-family:ui-monospace,Menlo,monospace}
+.bytebar{display:flex;height:22px;border-radius:7px;overflow:hidden;gap:2px;background:#0b0d17;border:1px solid var(--line);padding:3px}.bytebar i{display:block;border-radius:3px;min-width:3px}
+.tbl{overflow-x:auto}td.sw{width:14px;padding-right:0}td.sw i{display:block;width:10px;height:10px;border-radius:3px}.rank td.why{white-space:normal;color:var(--muted);font-size:13px;min-width:220px}.rank td.wrap{max-width:360px}
+.hexblob{margin:12px 0 0;padding:12px;background:#0b0d17;border:1px solid var(--line);border-radius:10px;word-break:break-all;line-height:1.7;letter-spacing:.02em}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}.kv>div{background:#0b0d17;border:1px solid var(--line);border-radius:10px;padding:10px 14px}.kv small{display:block;color:var(--muted);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase}.kv b{display:block;font:700 20px/1.3 system-ui}.kv em{display:block;font-style:normal;color:var(--muted);font-size:12px}.kv .sum{border-color:rgba(194,166,51,.55)}.kv .sum b{color:var(--gold)}
+.rank tr.miner td{background:rgba(194,166,51,.06)}
+.tag{display:inline-block;padding:1px 9px;border-radius:999px;background:#2a2230;border:1px solid rgba(194,166,51,.55);color:var(--gold);font-size:12px}.tag.in{background:#10262b;border-color:rgba(27,216,244,.5);color:var(--link)}
+@media(max-width:700px){.fld tr:first-child{display:none}.fld,.fld tbody{display:block}.fld tr{display:grid;grid-template-columns:14px 1fr auto;gap:2px 10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}.fld td{display:block;padding:0;border:0;white-space:normal}.fld td.r{text-align:right;color:var(--muted);font-size:12.5px}.fld td.r:nth-of-type(3){display:none}.fld td.r:nth-of-type(4)::before{content:'byte ' attr(data-b) ' · ';}.fld td.mono,.fld td.why{grid-column:2/4;max-width:none;min-width:0}.fld td.why{font-size:12.5px}}
+.sts{display:grid;gap:10px}.st{display:grid;grid-template-columns:28px minmax(0,1fr) minmax(0,1.25fr);gap:6px 16px;align-items:center;background:#0b0d17;border:1px solid var(--line);border-radius:12px;padding:12px 14px}@media(max-width:760px){.st{grid-template-columns:28px 1fr}.st .stb{grid-column:1/3}}
+.st .n{width:26px;height:26px;border-radius:50%;background:var(--gold);color:#1a1406;font:700 13px/26px system-ui;text-align:center}.stt b{display:block;font-size:14.5px}.stt em{display:block;font-style:normal;color:var(--muted);font-size:12.5px}
+.big2{font:700 22px/1.2 system-ui}.big2 small{font:500 13px system-ui;color:var(--muted)}.big2.mono{font-size:17px;color:var(--link)}.sub{color:var(--muted);font-size:12.5px;margin-top:2px}
+.fill{height:8px;border-radius:99px;background:var(--surface);border:1px solid var(--line);overflow:hidden;margin:6px 0 4px}.fill i{display:block;height:100%;background:linear-gradient(90deg,#2fb585,var(--link));border-radius:99px}
+.st.s4 .bytebar{height:20px}.legend2{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;font-size:12px;color:var(--muted)}.lg i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px}.lg em{font-style:normal;color:var(--text)}
+.st.flash{animation:flash 1.6s ease-out}@keyframes flash{0%{background:rgba(27,216,244,.25);border-color:var(--link)}100%{background:#0b0d17}}@media(prefers-reduced-motion:reduce){.st.flash{animation:none}}
+.cbstage{display:grid;grid-template-columns:minmax(0,340px) minmax(0,1fr);gap:26px;align-items:center;overflow:hidden}@media(max-width:860px){.cbstage{grid-template-columns:1fr}}
+.cbwrap{--S:216px;--D:78px;padding:calc(var(--D) + 6px) 0 4px 4px;display:flex;justify-content:center}
+.cbcube{position:relative;flex:none;width:var(--S);height:var(--S);margin:0 var(--D) 0 0}.cbcube.hit{animation:cbhit 1.1s ease-out 2}@keyframes cbhit{50%{filter:drop-shadow(0 0 22px rgba(60,226,107,.8))}}
+.cbfront{position:absolute;inset:0;background:#5a5148;overflow:hidden;border-radius:2px;display:flex;flex-direction:column;padding:11px 12px 30px}.cbtopf{position:absolute;left:0;top:calc(var(--D) * -1);width:var(--S);height:var(--D);background:#3d3730;transform-origin:0 100%;transform:skewX(-45deg)}.cbside{position:absolute;left:var(--S);top:0;width:var(--D);height:var(--S);background:#2c2823;transform-origin:0 0;transform:skewY(-45deg)}
+.cbfill{position:absolute;left:0;right:0;bottom:0;height:0;background:rgba(95,140,20,.9);transition:height .6s}.cbfoot{position:absolute;left:0;right:0;bottom:7px;text-align:center;font:600 11.5px ui-monospace,Menlo,monospace;color:#fff;z-index:2}
+.cbhead{position:relative;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.cbcoin{width:24px;height:24px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#ecd978,#c2a633);flex:none}.cbhead b{font:600 11.5px ui-monospace,Menlo,monospace;color:#7be8ff;text-align:right}
+.cbrows{position:relative;z-index:2;display:grid;gap:5px;font:12px ui-monospace,Menlo,monospace}.cbrows .r{display:flex;justify-content:space-between;gap:8px}.cbrows i{font-style:normal;color:#cdbfae;opacity:.8}.cbrows b{color:#fff;font-weight:700}.cbrows .hs b u{text-decoration:none;color:#3ce26b}
+.cbmeter{position:relative;z-index:2;display:flex;flex-wrap:wrap;gap:3px;align-items:center;margin-top:10px}.cbmeter i{width:15px;height:10px;border-radius:2px;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.18)}.cbmeter i.on{background:#3ce26b;border-color:#3ce26b}.cbmeter em{width:100%;font:500 10.5px system-ui;font-style:normal;color:#e8dccb;margin-top:3px}
+.cbbar{position:relative;z-index:2;display:flex;gap:2px;height:9px;margin-top:9px;padding:0}.cbbar i{display:block;border-radius:2px;min-width:2px;transition:opacity .25s}
+.cbcap{margin:6px 0 0;color:var(--muted);font-size:12px;text-align:center;max-width:340px}.cbright h2{font-size:17px;color:var(--text)}
+.st.on{border-color:var(--link);box-shadow:0 0 0 1px rgba(27,216,244,.35),0 0 18px rgba(27,216,244,.12)}.st{transition:border-color .25s,box-shadow .25s}
+/* all the pages made for the Find Mempool page: glass panels on a soft glow, quiet uppercase labels, hairline tables */
+body.g{background:radial-gradient(900px 520px at 8% -8%,rgba(194,166,51,.11),transparent 62%),radial-gradient(820px 520px at 100% 6%,rgba(27,216,244,.07),transparent 60%),var(--bg);background-attachment:fixed}
+.g .card{background:linear-gradient(135deg,rgba(255,255,255,.055),rgba(255,255,255,.012));border:1px solid rgba(255,255,255,.1);box-shadow:0 14px 40px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.g .card.main{border-color:rgba(255,255,255,.14);box-shadow:0 18px 50px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.07)}
+.g .card h2,.g .card.main h2{font:600 11.5px/1.3 system-ui;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+.g .tile{background:linear-gradient(135deg,rgba(255,255,255,.05),rgba(255,255,255,.012));border:1px solid rgba(255,255,255,.09);box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}.g .tile small{letter-spacing:.1em}
+.g .chip{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.12)}
+.g .step{background:rgba(255,255,255,.035);border-color:rgba(255,255,255,.09);color:#aab1cc}.g .step .n{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.28);color:#fff}
+.g .rank th{font-size:11px;letter-spacing:.1em;text-transform:uppercase}.g .rank td,.g .rank th{border-bottom-color:rgba(255,255,255,.07)}
+.g summary,.g .presets button,.g .pen{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.12)}.g .kv>div{background:rgba(255,255,255,.035);border-color:rgba(255,255,255,.09)}
+.g .hexblob,.g .hit{background:rgba(255,255,255,.035);border-color:rgba(255,255,255,.1)}.g .tbl{overflow-x:auto}
+.g .lead{color:#c5cbe3}
+/* the candidate page: a glass panel with the steps as a quiet timeline beside the block */
+.cbstage{background:radial-gradient(520px 320px at 16% 52%,rgba(194,166,51,.13),transparent 65%),radial-gradient(560px 300px at 100% 0%,rgba(27,216,244,.07),transparent 60%),linear-gradient(135deg,rgba(255,255,255,.055),rgba(255,255,255,.012));border:1px solid rgba(255,255,255,.1);box-shadow:0 18px 50px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.cbstage .sts .st{grid-template-columns:minmax(0,1fr);column-gap:0;padding:10px 4px 12px}.cbstage .sts .st .n{display:none}.cbstage .sts .st::after{display:none!important}.cbstage .sts .st .stt b,.cbstage .sts .st .stb,.cbstage .sts .st .stt em{grid-column:1}.cbstage .sts .st.on{background:none}.cbstage .sts .st.on .stt b{color:var(--link)}
+.cbstage .cbright h2{font:600 11.5px/1.2 system-ui;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}.cbstage .cbright>p{font-size:15px;color:#c5cbe3;margin:0 0 14px!important;max-width:60ch}
+.g .sts{gap:0}.g .st{position:relative;display:grid;grid-template-columns:44px minmax(0,1fr);column-gap:10px;row-gap:1px;align-items:start;background:transparent;border:0;border-radius:12px;padding:12px 12px 14px 4px;transition:background .3s}
+.g .st:not(:last-child)::after{content:'';position:absolute;left:21px;top:50px;bottom:-6px;width:1px;background:linear-gradient(rgba(255,255,255,.28),rgba(255,255,255,.05))}
+.g .st .n{grid-column:1;grid-row:1/4;width:34px;height:34px;margin:2px 0 0 4px;border-radius:50%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.28);color:#fff;font:600 13px/32px system-ui;text-align:center;transition:all .3s}
+.g .stt{display:contents}.g .stt b{grid-column:2;grid-row:1;font:600 11.5px/1.3 system-ui;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);transition:color .3s}
+.g .stb{grid-column:2;grid-row:2}.g .stt em{grid-column:2;grid-row:3;font-style:normal;color:#8e95b3;font-size:12.5px;margin-top:3px}
+.g .big2{font:600 26px/1.2 system-ui;letter-spacing:-.01em}.g .big2 small{font-size:13px}.g .sub{color:#aab1cc}
+.g .st.on{background:linear-gradient(90deg,rgba(27,216,244,.10),rgba(27,216,244,0) 70%);border:0;box-shadow:none}.g .st.on .n{background:rgba(27,216,244,.16);border-color:var(--link);color:var(--link);box-shadow:0 0 0 4px rgba(27,216,244,.10),0 0 18px rgba(27,216,244,.35)}.g .st.on .stt b{color:var(--link)}
+.g .fill{background:rgba(255,255,255,.07);border-color:transparent;height:6px}
+@media(max-width:860px){.g .big2{font-size:22px}}
+details{margin-top:14px}summary{display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;color:var(--text);font-size:13.5px;font-weight:600;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:#0b0d17;list-style:none}summary::-webkit-details-marker{display:none}summary::before{content:'▸';color:var(--link);transition:transform .15s}details[open] summary::before{transform:rotate(90deg)}summary:hover{border-color:var(--link)}details[open] summary{margin-bottom:10px}
+
+.pgnav{display:flex;flex-wrap:wrap;gap:8px}.pgnav a,.pgnav span{border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);border-radius:999px;padding:5px 14px;font-size:13px;color:var(--text);white-space:nowrap}.pgnav a:hover{border-color:var(--gold);text-decoration:none}.pgnav .here{border-color:var(--gold);color:var(--gold)}
+.cbmeter i{flex:1 1 0;min-width:3px;max-width:15px}
+.fsstage{width:100%;max-width:330px;margin:0 auto;display:grid;justify-items:center;gap:6px;padding:8px 0}.fstop{font:700 22px/1.2 system-ui}.fscap{color:var(--muted);font-size:13px}
+.fsbars{position:relative;width:100%;height:150px}.fb{position:absolute;left:0;top:0;bottom:0;width:calc(100%/7);display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;padding:0 5px;will-change:transform}.fb i{display:block;width:100%;border-radius:4px 4px 2px 2px;background:linear-gradient(180deg,#e8ebf5,#9aa3c4)}.fb:first-child i{background:linear-gradient(180deg,#9ad9e8,#1bd8f4)}.fb u{text-decoration:none;font:600 10.5px ui-monospace,Menlo,monospace;color:var(--muted)}
+.mkstage{width:100%;max-width:330px;margin:0 auto;display:grid;justify-items:center;gap:4px}.mkt{font:700 20px/1.2 system-ui}.mksvg{width:100%;height:auto;overflow:visible}.mksvg .cap{font:3px system-ui;fill:#9ea4bc;text-anchor:middle}.mksvg .v{font:600 5.4px ui-monospace,Menlo,monospace;fill:#fff;text-anchor:middle;dominant-baseline:middle}
+.mksvg .nd{stroke:rgba(255,255,255,.25);stroke-width:.4}.mksvg .nd.cb{fill:#c2a633}.mksvg .nd.tx1{fill:#2fb585}.mksvg .nd.l1{fill:#7a6cd6}.mksvg .nd.root{fill:#1bd8f4}.mksvg .nd.root+.v{fill:#06222a}.mksvg .ln{fill:none;stroke:#9ea4bc;stroke-width:.8;stroke-linecap:round}
+.mkcap{color:var(--muted);font-size:13px;text-align:center}.mkmore{color:var(--muted);font-size:11.5px;text-align:center;max-width:300px}
+.cbstage .cbleft{display:grid;justify-items:center;align-content:center}
+"""
+
+
+def page(title, body, glass=False, extra_css=""):
+    return ("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>" + html.escape(title) + " · Dogecoin explorer</title><style>" + CSS + (PAGES_CSS if glass else "") + (extra_css or FLOW_CSS) + "</style></head><body" + (" class=g" if glass else "") + ">"
+            "<header><a class=brand href='/'>Dogecoin <span>explorer</span></a>"
+            + ("" if title.startswith("Verified donation") else "<form action='/search'><input name=q placeholder='Block height, block hash or address' aria-label=Search>"
+            "<button>Search</button></form>") + "</header><nav class=subnav aria-label='Explorer sections'><a href='/'" + (" class=here" if not title.startswith("Verified") else "") + ">Block explorer</a>"
+            "<a class=ver href='/verified'" + (" aria-current=page" if title.startswith("Verified") else "") + ">✔ Verified donation addresses</a></nav><main>" + body + "</main>"
+            "<footer>Read from your own Dogecoin Core node · hashes.space</footer></body></html>")
+
+
+def doge(koinu):
+    return "{:,.8f}".format(koinu / COIN).rstrip("0").rstrip(".") + " DOGE"
+
+
+def ago(t):
+    s = max(0, int(time.time() - t))
+    return str(s) + "s ago" if s < 60 else str(s // 60) + "m ago" if s < 3600 else str(s // 3600) + "h ago" if s < 86400 else str(s // 86400) + "d ago"
+
+
+def home():
+    info = rpc("getblockchaininfo")
+    mp = rpc("getmempoolinfo")
+    blocks = last_blocks(15)
+    rows = "".join(
+        "<tr><td><a href='/block/" + b["hash"] + "'>" + "{:,}".format(b["height"]) + "</a></td><td class=muted>" + ago(b["time"]) + "</td><td>"
+        + html.escape(b["pool"]) + "</td><td class=r>" + str(b["nTx"]) + "</td><td class=r>" + "{:,.1f}".format(b["size"] / 1000) + " kB</td><td class=r>"
+        + doge(b["fees"]) + "</td></tr>" for b in blocks)
+    projected = _state["mempool"] or mempool_blocks()
+    prow = "".join("<tr><td>" + ("Next block" if i == 0 else "+" + str(i)) + "</td><td class=r>" + str(p["nTx"]) + "</td><td class=r>"
+                   + "{:,.1f}".format(p["blockSize"] / 1000) + " kB</td><td class=r>~" + str(p["medianFee"]) + " koinu/B</td></tr>"
+                   for i, p in enumerate(projected))
+    sync = info.get("verificationprogress", 0)
+    return page("Dogecoin", "<h1>Dogecoin</h1><div class=stats>"
+                + "".join("<div class='card stat'><span class=muted>" + k + "</span><b>" + v + "</b></div>" for k, v in [
+                    ("Block height", "{:,}".format(info["blocks"])), ("Mempool", "{:,} txs".format(mp["size"])),
+                    ("Mempool size", "{:,.1f} kB".format(mp["bytes"] / 1000)), ("Node sync", "{:.2f}%".format(sync * 100))])
+                + "</div><section class=card><h2>Verified donation addresses</h2><p style='margin:0'>Organisations that help animals and accept donations in DOGE: <a href='/verified'>see their verified addresses →</a></p></section>"
+                + "<section class=card><h2>Latest blocks</h2><table><tr><th>Height</th><th>Mined</th><th>Pool</th><th class=r>Txs</th><th class=r>Size</th><th class=r>Fees</th></tr>"
+                + rows + "</table></section><section class=card><h2>Mempool, in blocks of 1 MB</h2><table><tr><th>Block</th><th class=r>Txs</th><th class=r>Size</th><th class=r>Median fee</th></tr>"
+                + prow + "</table></section>")
+
+
+
+
+def block_mining(ident):
+    """the pool information of one block, for the pool page on hashes.space (the same shape as the Bitcoin explorers answer): the pool, the text in the coinbase
+    and every address the block reward was paid to, with the amount"""
+    h = rpc("getblockhash", int(ident)) if ident.isdigit() else ident
+    if not HEX64.fullmatch(h):
+        raise ValueError("not a block")
+    b = block_by_hash(h)
+    cb = b["txs"][0]
+    raw = b["coinbaseHex"]
+    text = bytes.fromhex(raw).decode("latin-1")
+    paid = {}
+    for o in cb["vout"]:
+        a = address(o["script"])
+        if a and valid_address(a):
+            paid[a] = paid.get(a, 0) + o["value"]
+    # a pool pays its miners out in batch transactions inside the blocks it mines: every transaction that pays ten or more outputs, with each address it pays
+    payouts = []
+    for t in b["txs"][1:]:
+        if len(t["vout"]) < 10:
+            continue
+        try:
+            f = flow_of(t, prev_outputs([i["prev"] for i in t["vin"]]))
+        except Exception:  # noqa: BLE001
+            f = flow_of(t)
+        outs, back = {}, {}
+        for o in f["outs"]:
+            a = o["addr"]
+            if a and valid_address(a):
+                bucket = back if o.get("change") else outs
+                bucket[a] = bucket.get(a, 0) + o["value"]
+        if len(outs) >= 10:
+            payouts.append({"txid": t["txid"], "count": len(outs), "sats": sum(outs.values()), "change": [{"address": a, "sats": v} for a, v in back.items()],
+                            "outputs": [{"address": a, "sats": v} for a, v in sorted(outs.items(), key=lambda kv: -kv[1])[:400]]})
+    payouts.sort(key=lambda x: -x["count"])
+    return {"id": h, "height": b["height"], "timestamp": b["time"], "pool": b["pool"], "miner": "", "payouts": payouts[:10],
+            "coinbaseText": "".join(c if 32 <= ord(c) < 127 else "\u00b7" for c in text), "coinbaseRaw": raw,
+            "reward": sum(o["value"] for o in cb["vout"]), "paidTo": [{"address": a, "sats": v} for a, v in paid.items()]}
+
+
+def payout_card(cb):
+    """every output of the block's first transaction: all the addresses the block reward was paid to (a pool can pay many), each with its amount"""
+    outs = [(address(o["script"]), o["value"]) for o in cb["vout"]]
+    total = sum(v for _, v in outs) or 1
+    def who(a):
+        return ("<a href='/address/" + a + "'>" + a + "</a>") if a and valid_address(a) else "<span class=muted>data output, no address</span>"
+    rows = "".join("<div class=pay><span class='mono wrap'>" + who(a) + "</span><span class=pamt>" + doge(v)[:-5] + " <small>DOGE</small></span><span class=ppct>{:.1f}%</span></div>".format(100.0 * v / total)
+                   for a, v in outs)
+    return ("<section class=card><h2>Paid to (" + "{:,}".format(len(outs)) + " output" + ("" if len(outs) == 1 else "s") + ")</h2>"
+            "<p class=muted style='margin:0 0 6px;font-size:12.5px'>Every address the block reward was paid to, read from the first transaction of the block.</p>"
+            + rows + "</section>")
+
+
+def block_page(ident):
+    h = rpc("getblockhash", int(ident)) if ident.isdigit() else ident
+    b = block_by_hash(h)
+    def btn(href, label):
+        return "<a href='/block/" + href + "'>" + label + "</a>" if href else "<span class=off>" + label + "</span>"
+    conf = b["confirmations"] or 0
+    head = ("<div class=bhero><h1>Block " + "{:,}".format(b["height"]) + "</h1><span class=chip>Mined by <b>" + html.escape(b["pool"]) + "</b></span>"
+            "<span class=chip>" + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(b["time"])) + " (" + ago(b["time"]) + ")</span>"
+            "<span class=chip><b>" + "{:,}".format(conf) + "</b> confirmation" + ("" if conf == 1 else "s") + "</span>"
+            "<div class=navbtns>" + btn(b["prev"], "← previous") + btn(b["next"], "next →") + "</div></div>"
+            "<div class=bhash><div class=bhtop><small>Block hash</small><button type=button class=bhcopy onclick=\"var b=this;navigator.clipboard&&navigator.clipboard.writeText('" + h
+            + "').then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1500)})\">Copy</button></div>"
+            "<span class='mono bhv'>" + h + "</span><span class=bhn>The block's unique id: a 64-character fingerprint of its header.</span></div>")
+    tiles = [("Transactions", "{:,}".format(b["nTx"]), ""), ("Fees", doge(b["fees"])[:-5], "DOGE · ~{:.0f} koinu/B".format(b["avgFee"])),
+             ("Reward", doge(b["fees"] + SUBSIDY)[:-5], "DOGE · subsidy 10,000 + fees"), ("Size", "{:,} B".format(b["size"]), ""),
+             ("Difficulty", "{:,.0f}".format(b["difficulty"] or 0), "")]
+    tl = "".join("<div class=tile><small>" + k + "</small><b style='font-size:18px'>" + v + "</b>" + (("<em>" + sub + "</em>") if sub else "") + "</div>" for k, v, sub in tiles)
+    mining = [("Pool", html.escape(b["pool"])), ("Subsidy", doge(SUBSIDY)), ("Fees", doge(b["fees"])), ("Average fee rate", "{:.2f} koinu/B".format(b["avgFee"]))]
+    gr = "<section class=card><h2>Mining</h2><dl>" + "".join("<dt>" + k + "</dt><dd>" + v + "</dd>" for k, v in mining) + "</dl></section>"
+    gr += payout_card(b["txs"][0])
+    return page("Block " + str(b["height"]), head + "<div class=tiles>" + tl + "</div><div class=groups>" + gr + "</div>", True)
+
+
+def verified_page():
+    def card(a, v):
+        site = ("<a class=vbtn href='" + html.escape(v["url"]) + "' target=_blank rel=noopener>Website ↗</a>") if v["url"].startswith("http") else ""
+        src = ("<div class=vsrc>Address published at <b>" + html.escape(re.sub(r"^https?://", "", v["source"]).rstrip("/")) + "</b></div>") if v["source"] else ""
+        return ("<article class=vcard data-s='" + html.escape((v["name"] + " " + v["category"] + " " + v["about"] + " " + a).lower(), quote=True) + "'>"
+                "<div class=vtop><span class=vchip>✔ Verified</span>" + ("<span class=vlive>● LIVE</span>" if v["streams"] else "") + "<span class=vcat>" + html.escape(v["category"]) + "</span></div>"
+                "<h3>" + html.escape(v["name"]) + "</h3><p class=vabout>" + html.escape(v["about"]) + "</p>"
+                "<div class=vaddr><span class=mono>" + a + "</span><button type=button class=vcopy data-a='" + a + "'>Copy</button></div>"
+                "<div class=vfoot>" + site + (("<a class=vbtn href='/address/" + a + "#live'>▶ Watch live</a>") if v["streams"] else "") + "<a class=vbtn href='/address/" + a + "'>Address page</a>"
+                + (("<span class=vdate>Verified " + html.escape(v["verified"]) + "</span>") if v["verified"] else "") + "</div>" + src + "</article>")
+    cards = "".join(card(a, v) for a, v in sorted(VERIFIED.items(), key=lambda kv: kv[1]["name"].lower()))
+    n = len(VERIFIED)
+    body = ("<div class=bhero><h1>Verified donation addresses</h1><span class=chip><b>" + str(n) + "</b> verified</span><span class=chip>Animal welfare</span>"
+            "<span class=chip>Donations in DOGE</span></div>"
+            "<section class=card><h2>Organisations that help animals</h2><p class=lead style='margin:0'>Dogecoin addresses of organisations that help animals and accept donations in DOGE. "
+            "Wherever one of these addresses appears in a transaction on this explorer, it is marked <span class=vchip>✔ Verified</span>, and a transaction that pays one gets its own chip.</p>"
+            "<p class=muted style='margin:8px 0 0;font-size:12.5px'>An address is only listed once it has been checked against the organisation's own website. Even so, check the address on the "
+            "organisation's own page before you send DOGE: a copied address cannot be taken back.</p></section>"
+            + (("<form class=finder onsubmit='return false'><input id=vq placeholder='Search an organisation, what it does, or an address' aria-label='Search the verified addresses' autocomplete=off spellcheck=false></form>"
+                "<div class=vgrid id=vgrid>" + cards + "</div><p class=muted id=vnone hidden style='text-align:center'>No verified address matches.</p>") if n
+               else "<section class=card><h2>No address yet</h2><p class=muted style='margin:0'>No organisation is verified on this explorer yet. Verified addresses appear here, "
+                    "and on every transaction that uses them, as soon as they are added.</p></section>")
+            + "<script>" + VERIFIED_JS + "</script>")
+    return page("Verified donation addresses", body, True, FLOW_CSS + WALLET_CSS + SHIP_CSS).replace("<main>", "<canvas id=dship aria-hidden=true></canvas><main>", 1).replace("</body>", "<script>" + SHIP_JS + "</script></body>", 1)
+
+
+SHIP_JS = r"""(function(){
+  function skySpline(wp, u) {
+    const m = wp.length, i = Math.floor(u), f = u - i, P = (k) => wp[((k % m) + m) % m], p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+    const c = (a, b, cc, d) => 0.5 * ((2 * b) + (-a + cc) * f + (2 * a - 5 * b + 4 * cc - d) * f * f + (-a + 3 * b - 3 * cc + d) * f * f * f);
+    return { x: c(p0.x, p1.x, p2.x, p3.x), y: c(p0.y, p1.y, p2.y, p3.y) };
+  }
+  function skyAt(r, u) {
+    const N = r.pts.length, v = (((u * r.K) % N) + N) % N, i = Math.floor(v), f = v - i, a = r.pts[i], b = r.pts[(i + 1) % N];
+    return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+  }
+  function skyShip(g, t, W, H, still) {
+    const r = skyRoute(W, H), u = still ? 0.3 : (t / 1000) * (58 / r.avg) + 0.3, pos = skyAt(r, u), nxt = skyAt(r, u + 0.02);
+    const dx = nxt.x - pos.x, dy = nxt.y - pos.y, dir = dx >= 0 ? 1 : -1, tilt = Math.atan2(dy, Math.abs(dx)) * 0.55, S = Math.max(17, Math.min(30, W / 32));
+    if (!still) for (let k = 14; k >= 1; k--) { const q = skyAt(r, u - k * 0.011); g.fillStyle = `rgba(255,${190 + k * 4},${120 + k * 6},${0.5 - k * 0.034})`; g.beginPath(); g.arc(q.x, q.y + Math.sin(t / 200 + k) * 1.2, Math.max(0.6, S * 0.09 * (1 - k / 16)), 0, 6.2832); g.fill(); }
+    g.save(); g.translate(pos.x, pos.y); g.scale(dir, 1); g.rotate(tilt); g.scale(S, S); g.lineJoin = 'round'; g.lineCap = 'round';
+    const ink = '#1a1630', lw = 0.07, fl = still ? 1 : 0.8 + 0.25 * Math.sin(t / 55) + 0.1 * Math.sin(t / 23);
+    // the flame
+    const fg = g.createLinearGradient(-1.35, 0, -1.35 - 1.1 * fl, 0); fg.addColorStop(0, 'rgba(255,214,120,.95)'); fg.addColorStop(0.5, 'rgba(255,120,40,.7)'); fg.addColorStop(1, 'rgba(255,80,40,0)');
+    g.fillStyle = fg; g.beginPath(); g.moveTo(-1.3, -0.22); g.quadraticCurveTo(-1.3 - 0.9 * fl, 0.02, -1.3, 0.3); g.closePath(); g.fill();
+    // fin
+    g.fillStyle = '#ff8a3d'; g.strokeStyle = ink; g.lineWidth = lw; g.beginPath(); g.moveTo(-0.85, 0.05); g.lineTo(-1.45, -0.55); g.lineTo(-1.3, 0.2); g.closePath(); g.fill(); g.stroke();
+    // hull
+    const hg = g.createLinearGradient(0, -0.3, 0, 0.8); hg.addColorStop(0, '#f4f7ff'); hg.addColorStop(1, '#8c97cc');
+    g.fillStyle = hg; g.beginPath(); g.ellipse(0, 0.22, 1.4, 0.55, 0, 0, 6.2832); g.fill(); g.stroke();
+    g.fillStyle = '#ff8a3d'; g.beginPath(); g.ellipse(0, 0.26, 1.3, 0.1, 0, 0, 6.2832); g.fill();
+    for (let k = 0; k < 4; k++) { g.fillStyle = k % 2 ? '#ffd27a' : '#7be8ff'; g.beginPath(); g.arc(-0.75 + k * 0.5, 0.52, 0.065, 0, 6.2832); g.fill(); }
+    // the pilot: a shiba inu behind the glass
+    const hx = 0.2, hy = -0.12;
+    g.fillStyle = '#e0963f'; g.beginPath(); g.arc(hx, hy, 0.5, 0, 6.2832); g.fill();
+    for (const sd of [-1, 1]) {
+      g.fillStyle = '#e0963f'; g.beginPath(); g.moveTo(hx + sd * 0.14, hy - 0.42); g.lineTo(hx + sd * 0.3, hy - 0.9); g.lineTo(hx + sd * 0.5, hy - 0.3); g.closePath(); g.fill();
+      g.fillStyle = '#f6c9a0'; g.beginPath(); g.moveTo(hx + sd * 0.22, hy - 0.46); g.lineTo(hx + sd * 0.31, hy - 0.74); g.lineTo(hx + sd * 0.42, hy - 0.36); g.closePath(); g.fill();
+    }
+    g.fillStyle = '#fff3df'; g.beginPath(); g.ellipse(hx, hy + 0.14, 0.34, 0.25, 0, 0, 6.2832); g.fill();
+    g.beginPath(); g.ellipse(hx - 0.26, hy + 0.04, 0.16, 0.2, 0, 0, 6.2832); g.ellipse(hx + 0.26, hy + 0.04, 0.16, 0.2, 0, 0, 6.2832); g.fill();
+    g.fillStyle = '#fff3df'; for (const sd of [-1, 1]) { g.beginPath(); g.arc(hx + sd * 0.19, hy - 0.26, 0.055, 0, 6.2832); g.fill(); }
+    g.fillStyle = ink; for (const sd of [-1, 1]) { g.beginPath(); g.arc(hx + sd * 0.19, hy - 0.1, 0.055, 0, 6.2832); g.fill(); }
+    g.beginPath(); g.ellipse(hx, hy + 0.08, 0.075, 0.05, 0, 0, 6.2832); g.fill();
+    g.strokeStyle = ink; g.lineWidth = 0.035; g.beginPath(); g.moveTo(hx, hy + 0.12); g.lineTo(hx, hy + 0.17); g.moveTo(hx - 0.11, hy + 0.2); g.quadraticCurveTo(hx, hy + 0.3, hx + 0.11, hy + 0.2); g.stroke();
+    // the glass dome over the pilot
+    const dg = g.createLinearGradient(-0.5, -0.9, 0.7, 0.2); dg.addColorStop(0, 'rgba(190,240,255,.5)'); dg.addColorStop(1, 'rgba(120,200,255,.12)');
+    g.fillStyle = dg; g.strokeStyle = 'rgba(210,245,255,.9)'; g.lineWidth = 0.05; g.beginPath(); g.arc(hx, hy + 0.02, 0.8, Math.PI, 0); g.lineTo(hx + 0.8, hy + 0.3); g.lineTo(hx - 0.8, hy + 0.3); g.closePath(); g.fill(); g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,.75)'; g.lineWidth = 0.05; g.beginPath(); g.arc(hx, hy + 0.02, 0.64, Math.PI * 1.12, Math.PI * 1.38); g.stroke();
+    g.restore();
+  }
+
+  var _route = null;
+  function skyRoute(W, H) {
+    var key = W + 'x' + H; if (_route && _route.key === key) return _route;
+    var n = [[0.08, 0.30], [0.30, 0.14], [0.55, 0.26], [0.86, 0.10], [0.94, 0.42], [0.70, 0.62], [0.90, 0.86], [0.55, 0.78], [0.30, 0.92], [0.10, 0.70], [0.26, 0.48]];
+    var wp = n.map(function (p) { return { x: p[0] * W, y: p[1] * H }; }), K = 14, pts = [], len = 0;
+    for (var i = 0; i < wp.length * K; i++) pts.push(skySpline(wp, i / K));
+    pts.forEach(function (q, i) { var b = pts[(i + 1) % pts.length]; len += Math.hypot(b.x - q.x, b.y - q.y); });
+    return (_route = { pts: pts, K: K, key: key, avg: Math.max(40, len / wp.length) });
+  }
+
+  var cv = document.getElementById('dship'); if (!cv) return;
+  var g = cv.getContext('2d'), W = 0, H = 0, still = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
+  function size() { var d = Math.min(2, window.devicePixelRatio || 1), w = window.innerWidth, h = window.innerHeight; if (w === W && h === H) return; W = w; H = h; cv.width = w * d; cv.height = h * d; cv.style.width = w + 'px'; cv.style.height = h + 'px'; g.setTransform(d, 0, 0, d, 0, 0); }
+  function frame(t) { size(); g.clearRect(0, 0, W, H); skyShip(g, t, W, H, still); if (!still) requestAnimationFrame(frame); }
+  window.addEventListener('resize', function () { if (still) requestAnimationFrame(frame); });
+  requestAnimationFrame(frame);
+})();"""
+
+
+SHIP_CSS = """
+#dship{position:fixed;inset:0;width:100vw;height:100vh;z-index:0;pointer-events:none}
+body.g>header,body.g>nav,body.g>main,body.g>footer{position:relative;z-index:1}
+"""
+
+
+VERIFIED_JS = """
+(function(){var q=document.getElementById('vq'),g=document.getElementById('vgrid'),none=document.getElementById('vnone');
+if(q&&g)q.addEventListener('input',function(){var t=q.value.trim().toLowerCase(),shown=0;g.querySelectorAll('.vcard').forEach(function(c){var ok=!t||c.dataset.s.indexOf(t)>-1;c.hidden=!ok;if(ok)shown++});none.hidden=shown>0});
+document.querySelectorAll('.vcopy').forEach(function(b){b.addEventListener('click',function(){var a=b.dataset.a,done=function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1600)};
+if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(a).then(done,function(){})}else{var t=document.createElement('textarea');t.value=a;document.body.appendChild(t);t.select();try{document.execCommand('copy');done()}catch(e){}t.remove()}})})})();
+"""
+
+
+def address_page(a):
+    return page("Address", wallet_html(a), True, FLOW_CSS + WALLET_CSS)
+
+
+_bal = {}
+_scan_lock = threading.Lock()
+
+
+def address_balance(a):
+    """{"total": koinu, "count": n} from the node's UTXO set (scantxoutset, no address index needed); cached for two minutes.
+    Raises RpcError when the node cannot scan (older Dogecoin Core) or is busy."""
+    hit = _bal.get(a)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    if not _scan_lock.acquire(timeout=240):
+        raise RpcError("The node is busy scanning another address. Try again in a moment.")
+    try:
+        hit = _bal.get(a)
+        if hit and time.time() - hit[0] < 120:
+            return hit[1]
+        try:
+            r = rpc("scantxoutset", "start", ["addr(" + a + ")"], timeout=600)
+        except RpcError as exc:
+            if "not found" in str(exc).lower():
+                raise RpcError("This version of Dogecoin Core cannot look up the balance of an address (no scantxoutset).")
+            raise
+        if not isinstance(r, dict) or r.get("success") is False:
+            raise RpcError("The node could not finish the scan. Try again in a moment.")
+        us = sorted(({"txid": u["txid"], "vout": u["vout"], "value": int(round(float(u["amount"]) * COIN)), "height": u.get("height")} for u in r.get("unspents", [])),
+                    key=lambda u: -(u["height"] or 0))
+        out = {"address": a, "total": sum(u["value"] for u in us), "count": len(us), "height": r.get("height")}
+        if len(_bal) > 300:
+            _bal.clear()
+        _bal[a] = (time.time(), out)
+        return out
+    finally:
+        _scan_lock.release()
+
+
+WALLET_JS = r"""(function(){var a=__ADDR__;var amt=document.getElementById('wamt'),sub=document.getElementById('wsub'),bar=document.getElementById('wbar');
+function fmt(k){return (k/1e8).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:8})}
+function esc(x){var d=document.createElement('div');d.textContent=x;return d.innerHTML}
+fetch('/api/v1/address/'+a).then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j}})}).then(function(x){bar.hidden=true;
+if(!x.ok){amt.innerHTML='<span class=err>'+esc(x.j.error||'Could not read the balance')+'</span>';sub.textContent='';return}
+var j=x.j;amt.innerHTML='<span class=coin>Ð</span>'+fmt(j.total)+' <small>DOGE</small>';
+sub.textContent=j.count?(j.count.toLocaleString('en-US')+' unspent output'+(j.count==1?'':'s')+' · at block '+(j.height||0).toLocaleString('en-US')):'No coins in this wallet right now.';
+}).catch(function(){bar.hidden=true;amt.innerHTML='<span class=err>The explorer could not be reached</span>';sub.textContent=''});
+var c=document.querySelector('.vcopy');if(c)c.onclick=function(){try{navigator.clipboard.writeText(a);c.textContent='Copied';setTimeout(function(){c.textContent='Copy'},1500)}catch(e){}}})();"""
+
+
+def live_html(a):
+    v = VERIFIED.get(a)
+    if not v or not v["streams"]:
+        return ""
+    out = ""
+    for i, st in enumerate(v["streams"]):
+        play = ("<button type=button class=lplay data-k='" + st["kind"] + "' data-s='" + html.escape(st["src"], quote=True) + "' aria-label='Play: " + html.escape(st["title"], quote=True)
+                + "'><span class=ltri>▶</span><b>Watch live</b><small>Starts when you press play: nothing is loaded from the stream until then</small></button>") if st["kind"] != "link" else ("<a class=lplay href='" + html.escape(st["url"], quote=True) + "' target=_blank rel='noopener noreferrer'><span class=ltri>▶</span><b>Watch live</b><small>This stream opens on its own site</small></a>")
+        out += ("<div class=lbox><div class=lscreen>" + play + "</div><div class=lcap><span class=lbadge>● LIVE</span><b>" + html.escape(st["title"]) + "</b>"
+                "<a class=vbtn href='" + html.escape(st["url"], quote=True) + "' target=_blank rel='noopener noreferrer'>Open on its own site ↗</a></div></div>")
+    return ("<section class='card live' id=live><h2 style='margin:0 0 6px'>Live from " + html.escape(v["name"]) + "</h2><p class=muted style='margin:0 0 12px;font-size:12.5px'>"
+            "The organisation's own livestream of its logistics. The explorer only links to it: the video comes from the organisation's streaming page and is not checked here.</p>"
+            "<div class=lgrid>" + out + "</div></section><script>" + LIVE_JS + "</script>")
+
+
+LIVE_JS = r"""(function(){document.querySelectorAll('.lplay').forEach(function(b){b.addEventListener('click',function(){var box=b.parentNode,k=b.dataset.k,s=b.dataset.s.replace('{host}',encodeURIComponent(location.hostname)),el;
+if(k==='video'){el=document.createElement('video');el.controls=true;el.autoplay=true;el.playsInline=true;el.src=s}
+else{el=document.createElement('iframe');el.src=s;el.allow='autoplay; fullscreen; picture-in-picture';el.allowFullscreen=true;el.referrerPolicy='strict-origin-when-cross-origin';el.title='Livestream'}
+box.innerHTML='';box.appendChild(el)})})})();"""
+
+
+def wallet_html(a):
+    v = VERIFIED.get(a)
+    head = ("<p class=wver><span class=vbig>✔ Verified</span> · " + html.escape(v["name"]) + " <em class=ftag>" + html.escape(v["category"]) + " · accepts DOGE donations</em></p>") if v else ""
+    about = ""
+    if v:
+        about = ("<section class=card><p style='margin:0'>" + html.escape(v["about"]) + "</p>"
+                 + ("<p style='margin:8px 0 0'><a href='" + html.escape(v["url"]) + "' target=_blank rel=noopener>" + html.escape(v["url"]) + "</a></p>" if v["url"].startswith("http") else "")
+                 + ("<p class=muted style='margin:8px 0 0'>Published at " + html.escape(v["source"]) + "</p>" if v["source"] else "")
+                 + ("<p class=muted style='margin:4px 0 0'>Verified on " + html.escape(v["verified"]) + "</p>" if v["verified"] else "")
+                 + "<p class=muted style='margin:8px 0 0'>Check this address against the organisation's own website before you send.</p></section>")
+    return (head + live_html(a) + "<h1>Wallet</h1><section class='card wallet'><div class=wtop><small>Address</small><div class=vaddr><span class=mono>" + html.escape(a)
+            + "</span><button type=button class=vcopy>Copy</button></div></div>"
+            "<div class=wbal><small>Balance</small><div class=wamt id=wamt><span class=wload>Reading the balance from your node…</span></div>"
+            "<div class=wbar id=wbar><i></i></div><div class=sub id=wsub>Scanning the node's unspent coins. The first lookup can take up to a minute.</div></div></section>"
+            + about
+            + "<p class=muted style='margin:4px 2px'>The balance is the sum of the unspent outputs the node holds for this address right now. <a href='/verified'>Verified donation addresses →</a></p>"
+            "<script>" + WALLET_JS.replace("__ADDR__", json.dumps(a).replace("<", "\\u003c")) + "</script>")
+
+
+WALLET_CSS = """
+.lgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px}.lbox{display:grid;gap:8px;min-width:0}
+.lscreen{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:radial-gradient(120% 100% at 30% 20%,rgba(194,166,51,.22),rgba(11,13,23,.9)),#0b0d17;border:1px solid rgba(255,255,255,.12);display:grid;place-items:center}
+.lscreen iframe,.lscreen video{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
+.lplay{all:unset;cursor:pointer;display:grid;gap:4px;justify-items:center;text-align:center;padding:16px;color:var(--text)}.lplay b{font:600 15px system-ui}.lplay small{color:var(--muted);font-size:11.5px;max-width:30ch}
+.ltri{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;background:radial-gradient(circle at 35% 30%,#ecd978,#c2a633);color:#1a1406;font-size:20px;padding-left:4px;box-shadow:0 0 0 0 rgba(194,166,51,.5);animation:lpulse 2.2s infinite}
+.lplay:hover .ltri,.lplay:focus-visible .ltri{transform:scale(1.06)}@keyframes lpulse{70%{box-shadow:0 0 0 14px rgba(194,166,51,0)}}@media(prefers-reduced-motion:reduce){.ltri{animation:none}}
+.lcap{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}.lcap .vbtn{margin-left:auto}
+.lbadge{font:700 11px system-ui;letter-spacing:.1em;color:#ff5d5d;border:1px solid rgba(255,93,93,.5);border-radius:99px;padding:2px 8px}
+.vlive{font:700 11px system-ui;letter-spacing:.08em;color:#ff5d5d;border:1px solid rgba(255,93,93,.5);border-radius:99px;padding:2px 8px}
+.wallet{display:grid;gap:16px}.wtop,.wbal{display:grid;gap:6px}.wtop>small,.wbal>small{color:var(--muted);font-size:11.5px;letter-spacing:.13em;text-transform:uppercase}
+.wamt{font:700 clamp(26px,5vw,38px)/1.15 system-ui;color:var(--gold);display:flex;align-items:center;gap:12px;flex-wrap:wrap;word-break:break-all}.wamt small{font:600 16px system-ui;color:var(--muted)}
+.wamt .coin{display:inline-block;width:36px;height:36px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#ecd978,#c2a633);color:#1a1406;font:700 22px/36px system-ui;text-align:center;flex:none}
+.wload{font:500 15px system-ui;color:var(--muted)}.wbar{height:6px;border-radius:6px;background:rgba(255,255,255,.08);overflow:hidden;position:relative}.wbar[hidden]{display:none}
+.wbar i{position:absolute;inset:0 auto 0 0;width:35%;border-radius:6px;background:linear-gradient(90deg,#c2a633,#ecd978);animation:wslide 1.4s ease-in-out infinite}
+@keyframes wslide{0%{left:-35%}100%{left:100%}}.wver{margin:0 0 4px;display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
+.wscroll{overflow-x:auto}.wscroll td,.wscroll th{white-space:nowrap}
+.fbox a.addr{color:var(--text)}.fbox a.addr:hover{color:var(--gold);text-decoration:underline}
+"""
+
+
+def prev_outputs(txids):
+    """{txid: [(value, address), ...]} of the transactions whose outputs these inputs spend, from the node (needs -txindex, or the mempool); None where it cannot say"""
+    need = [t for t in dict.fromkeys(txids) if t not in _prev]
+    if need:
+        try:
+            res = rpc_batch([("getrawtransaction", (t, 0)) for t in need])
+        except RpcError:
+            res = [None] * len(need)
+        if len(_prev) > 4000:
+            _prev.clear()
+        for t, hx in zip(need, res):
+            try:
+                _prev[t] = [(o["value"], address(o["script"])) for o in read_tx(Reader(bytes.fromhex(hx)))["vout"]] if hx else None
+            except (ValueError, KeyError, struct.error):
+                _prev[t] = None
+    return {t: _prev.get(t) for t in txids}
+
+
+def flow_of(tx, prev=None):
+    """where the coins of one transaction go: who they come from (address, amount when the node can say), and every output with the address it pays.
+    An output that pays an address that also sent is change going back to the sender."""
+    outs = [{"addr": address(o["script"]), "value": o["value"], "script": o["script"].hex()} for o in tx["vout"]]
+    total_out = sum(o["value"] for o in outs)
+    if tx["coinbase"]:
+        return {"coinbase": True, "ins": [], "outs": outs, "total_out": total_out, "total_in": None, "fee": None}
+    senders, known = {}, True
+    for i in tx["vin"]:
+        p = (prev or {}).get(i["prev"])
+        value = addr = None
+        if p and i["n"] < len(p):
+            value, addr = p[i["n"]]
+        if not addr:
+            addr = sender_address(i["script"])
+        if value is None:
+            known = False
+        e = senders.setdefault(addr or "?", {"addr": addr, "value": 0, "known": True, "n": 0})
+        e["n"] += 1
+        if value is None:
+            e["known"] = False
+        else:
+            e["value"] += value
+    mine = {a for a in senders if a != "?"}
+    for o in outs:
+        o["change"] = bool(o["addr"]) and o["addr"] in mine
+    total_in = sum(e["value"] for e in senders.values()) if known else None
+    return {"coinbase": False, "ins": list(senders.values()), "outs": outs, "total_out": total_out, "total_in": total_in,
+            "fee": (total_in - total_out) if total_in is not None else None}
+
+
+FLOW_CSS = """
+.flow{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:14px;align-items:center}
+.fcol{display:grid;gap:8px;align-content:center}.fcol>small{color:var(--muted);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase}
+.fbox{border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.035);border-radius:10px;padding:8px 12px;display:grid;gap:2px;min-width:0}
+.fbox .addr{font:12.5px/1.35 ui-monospace,Menlo,monospace;word-break:break-all;color:var(--text)}.fbox .amt{font:600 14px system-ui;color:var(--gold)}
+.fbox.chg{border-style:dashed;border-color:rgba(27,216,244,.45)}.fbox.new{border-color:rgba(60,226,107,.5)}.fbox .ftag{font-style:normal;font-size:11.5px;color:var(--muted)}
+.farrow{display:grid;justify-items:center;gap:2px;color:var(--muted);font-size:12px;text-align:center}.farrow svg{width:64px;height:24px;color:var(--link)}.farrow b{color:var(--text);font-size:13px}
+@media(max-width:760px){.flow{grid-template-columns:minmax(0,1fr)}.farrow svg{transform:rotate(90deg);margin:20px 0}}
+.g .fbox{background:linear-gradient(135deg,rgba(255,255,255,.055),rgba(255,255,255,.012));border-color:rgba(255,255,255,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+.fbox .amt::before{content:'Ð';display:inline-block;width:18px;height:18px;margin-right:7px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#ecd978,#c2a633);color:#1a1406;font:700 11px/18px system-ui;text-align:center;vertical-align:1px}
+.g .farrow svg{color:var(--gold)}.g .txcard{border-bottom-color:rgba(255,255,255,.07)}.g .txhead b{color:var(--gold)}
+.g .fbox.chg{border-color:rgba(194,166,51,.55)}.g .fbox.new{border-color:rgba(194,166,51,.55)}
+.g .fcol>small{letter-spacing:.13em}.g .vtbl th{font-size:11px;letter-spacing:.1em;text-transform:uppercase}.g .vtbl td,.g .vtbl th{border-bottom-color:rgba(255,255,255,.07)}
+.vgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,330px),1fr));gap:14px}.vgrid .vcard[hidden]{display:none}
+.vcard{display:grid;gap:9px;align-content:start;padding:16px;border-radius:12px;background:linear-gradient(135deg,rgba(255,255,255,.055),rgba(255,255,255,.012));border:1px solid rgba(255,255,255,.1);box-shadow:0 14px 40px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.05)}
+.vcard h3{margin:0;font:600 17px/1.3 system-ui}.vcard .vabout{margin:0;color:#c5cbe3;font-size:13.5px}.vtop{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between}
+.vcat{font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.vaddr{display:flex;gap:8px;align-items:center;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.2);border-radius:10px;padding:8px 8px 8px 12px}.vaddr .mono{flex:1;min-width:0;word-break:break-all;font-size:12.5px}
+.vcopy,.vbtn{border:1px solid rgba(194,166,51,.55);background:rgba(194,166,51,.1);color:var(--gold);border-radius:999px;padding:5px 13px;font:600 12.5px system-ui;cursor:pointer;white-space:nowrap}.vbtn:hover,.vcopy:hover{background:rgba(194,166,51,.2);text-decoration:none}
+.vfoot{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.vdate{margin-left:auto;color:var(--muted);font-size:12px}.vsrc{color:var(--muted);font-size:12px;word-break:break-all}
+.finder{display:flex;gap:8px;max-width:520px}
+.fbox.ver{border-color:rgba(60,226,107,.6);background:rgba(60,226,107,.06)}.vmark{font:600 12.5px system-ui;color:#3ce26b}.vmark:hover{text-decoration:underline}
+.vchip{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;background:rgba(60,226,107,.1);border:1px solid rgba(60,226,107,.5);color:#3ce26b;font-size:12px;font-weight:600}
+.vtbl td{white-space:normal;vertical-align:top}.vtbl .mono{word-break:break-all}.vbig{font:700 20px system-ui;color:#3ce26b}
+.txcard{display:grid;gap:10px;padding:14px 0;border-bottom:1px solid var(--line)}.txcard:last-child{border-bottom:0}
+.txhead{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 14px}.txhead .mono{word-break:break-all}.txhead small{color:var(--muted)}
+.txnav{display:flex;gap:10px;justify-content:space-between;margin-top:6px}.txnav a,.txnav span{border:1px solid var(--line);border-radius:8px;padding:6px 12px}.txnav span{color:var(--muted);opacity:.5}
+"""
+
+
+# ---------- the block your node would build: the pages the Find Mempool page opens from the four blocks of the Dogecoin chain ----------
+# /fee-sorting, /coinbase-merkle, /block-assembly and /block-candidate (each also as .json), all from the node's own getblocktemplate (or, when the
+# node will not give one, from its mempool, cut the way the template is: best fee per byte first, parents before children, up to the size limit)
+
+BLOCK_SECONDS = 60
+_tpl = {"at": 0.0, "v": None}
+
+
+def merkle_root(ids):
+    """the merkle root of 32-byte hashes (internal order), and the number of rounds it takes: pairs are hashed twice with SHA-256, an odd one out is paired with itself"""
+    level, rounds = list(ids), 0
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        level = [sha256d(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+        rounds += 1
+    return level[0], rounds
+
+
+def pick_txs(rows, pool, limit):
+    """what the node puts in a block: best fee rate first, a parent before its child, until the block is full (1,000 bytes are kept for the coinbase)"""
+    chosen, ids, size, pending, moved = [], set(), 1000, rows, True
+    while pending and moved:
+        moved, later = False, []
+        for r in pending:
+            if any(d in pool and d not in ids for d in pool[r[1]].get("depends", [])):
+                later.append(r)
+                continue
+            if size + r[2] > limit:
+                continue
+            chosen.append(r)
+            ids.add(r[1])
+            size += r[2]
+            moved = True
+        pending = later
+    return chosen
+
+
+def doge_template():
+    """everything the four pages show, from your node (cached for 8 seconds)"""
+    with _lock:
+        if _tpl["v"] and time.time() - _tpl["at"] < 8:
+            return _tpl["v"]
+    best = rpc("getbestblockhash")
+    hd = rpc("getblockheader", best)
+    height = hd["height"] + 1
+    pool = rpc("getrawmempool", True)
+    try:
+        mpi = rpc("getmempoolinfo")
+    except RpcError:
+        mpi = {}
+    try:
+        gbt = rpc("getblocktemplate", {})
+    except RpcError:
+        gbt = None
+    rows = sorted(((v["fee"] * COIN / max(1, v["size"]), k, v["size"], round(v["fee"] * COIN)) for k, v in pool.items()), key=lambda r: r[0], reverse=True)
+    limit = int(gbt.get("sizelimit") or MAX_BLOCK) if gbt else MAX_BLOCK
+    if gbt and isinstance(gbt.get("transactions"), list):
+        txs = [(t.get("txid") or t["hash"], len(t["data"]) // 2, int(t.get("fee") or 0)) for t in gbt["transactions"]]
+        source = "the block template of your node"
+    else:
+        txs = [(r[1], r[2], r[3]) for r in pick_txs(rows, pool, limit)]
+        source = "your node's mempool"
+    fees = sum(t[2] for t in txs)
+    cb = sha256d(("coinbase|" + str(height) + "|hashes.space").encode())     # stand-in: the real coinbase only exists when a miner builds it
+    leaves = [cb] + [bytes.fromhex(t[0])[::-1] for t in txs]
+    root, rounds = merkle_root(leaves)
+    version = int(gbt["version"]) if gbt else int(hd["version"])
+    prev = gbt["previousblockhash"] if gbt else best
+    bits = gbt["bits"] if gbt else hd["bits"]
+    now = int(gbt["curtime"]) if gbt else int(time.time())
+    header = (version & 0xFFFFFFFF).to_bytes(4, "little") + bytes.fromhex(prev)[::-1] + root + now.to_bytes(4, "little") + bytes.fromhex(bits)[::-1] + b"\0\0\0\0"
+    mr = mpi.get("mempoolminfee") or mpi.get("minrelaytxfee")
+    v = {"height": height, "version": version, "prev": prev, "bits": bits, "bitsExact": bool(gbt), "time": now, "last": int(hd["time"]), "diff": float(hd["difficulty"]),
+         "txs": txs, "size": sum(t[1] for t in txs), "fees": fees, "reward": int(gbt["coinbasevalue"]) if gbt and gbt.get("coinbasevalue") else SUBSIDY + fees,
+         "root": root[::-1].hex(), "cb": cb[::-1].hex(), "leaves": [x[::-1].hex() for x in leaves[:4]], "nleaves": len(leaves), "rounds": rounds,
+         "l1": [sha256d(leaves[i] + (leaves[i + 1] if i + 1 < len(leaves) else leaves[i]))[::-1].hex() for i in (0, 2) if i < len(leaves) and len(leaves) > 1], "hdr": header.hex(), "rows": rows, "waiting": len(pool),
+         "poolBytes": int(mpi.get("bytes") or sum(r[2] for r in rows)), "limit": limit, "source": source, "minrelay": (float(mr) * COIN / 1000.0) if mr else None}
+    with _lock:
+        _tpl["v"], _tpl["at"] = v, time.time()
+    return v
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def hashrate_text(h):
+    for u in ("H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"):
+        if h < 1000 or u == "EH/s":
+            return "{:,.2f}".format(h) if h < 100 else "{:,.0f}".format(h), u
+        h /= 1000.0
+
+
+def st(n, title, cap, body, cls=""):
+    return ("<div class='st " + cls + "'><span class=n>" + n + "</span><div class=stt><b>" + title + "</b><em>" + cap + "</em></div><div class=stb>" + body + "</div></div>")
+
+
+def short(h, a=8, b=6):
+    return esc(h[:a]) + "…" + esc(h[-b:])
+
+
+def stage(left, steps, h2, intro, caption=""):
+    return ("<section class='card main cbstage'><div class=cbleft>" + left + ("<p class=cbcap>" + caption + "</p>" if caption else "") + "</div>"
+            "<div class=cbright><h2>" + h2 + "</h2><p class=muted style='margin:0 0 12px'>" + intro + "</p><div class=sts id=steps>" + steps + "</div></div></section>")
+
+
+def hero(title, chips):
+    return "<div class=bhero><h1>" + title + "</h1><span id=chips style='display:contents'>" + chips + "<span class=chip id=upd><i class=dot></i> live</span></span></div>"
+
+
+def chips_of(t, extra):
+    return "<span class=chip>Block being mined <b>" + "{:,}".format(t["height"]) + "</b></span>" + extra
+
+
+def other_pages(here):
+    names = [("/fee-sorting", "Fee sorting"), ("/coinbase-merkle", "Coinbase &amp; merkle root"), ("/block-assembly", "Block assembly"), ("/block-candidate", "Candidate block")]
+    return "<nav class=pgnav>" + "".join("<a href='" + p + "'>" + n + "</a>" if p != here else "<span class=here>" + n + "</span>" for p, n in names) + "</nav>"
+
+
+# ----- 1. Fee sorting -----
+
+def fee_parts():
+    t = doge_template()
+    rows, inb = t["rows"], {x[0] for x in t["txs"]}
+    total, fit = len(rows), len(t["txs"])
+    top = rows[0][0] if rows else 0
+    med = rows[len(rows) // 2][0] if rows else 0
+    low = min((r[0] for r in rows if r[1] in inb), default=0)
+    chips = chips_of(t, "<span class=chip><b>" + "{:,}".format(total) + "</b> waiting</span>")
+    unit = "koinu/B"
+    steps = (st("1", "Collect what waits", "the unconfirmed transactions in your node's mempool",
+                "<div class=big2>" + "{:,}".format(total) + " <small>transactions</small></div><div class=sub>" + "{:,.1f}".format(t["poolBytes"] / 1000.0) + " kB"
+                + ((" · the node relays nothing below " + "{:,.0f}".format(t["minrelay"]) + " " + unit) if t["minrelay"] else "") + "</div>", "s1")
+             + st("2", "Rate each one", "fee ÷ size: the koinu it pays the miner for every byte it takes",
+                  "<div class=big2>" + "{:,.0f}".format(top) + " <small>" + unit + " at the top</small></div><div class=sub>median " + "{:,.0f}".format(med) + " " + unit + "</div>", "s2")
+             + st("3", "Sort, best rate first", "a transaction that spends another one waits for it, so a parent always goes before its child",
+                  "<div class=big2>#1 → #" + "{:,}".format(total) + "</div><div class=sub>" + ("the highest rate is " + "{:,.0f}".format(top / med) + "× the median" if med else "nothing is waiting") + "</div>", "s3")
+             + st("4", "Fill the block", "from the top until the block is full (" + "{:,}".format(t["limit"]) + " bytes at most, 1,000 kept for the coinbase)",
+                  "<div class=big2>" + "{:,}".format(fit) + " <small>of " + "{:,}".format(total) + " fit</small></div><div class=fill><i style='width:" + "{:.0f}".format(min(100, t["size"] / t["limit"] * 100)) + "%'></i></div>"
+                  "<div class=sub>" + "{:,.1f}".format(t["size"] / 1000.0) + " kB · fees " + doge(t["fees"]) + (" · it takes about " + "{:,.0f}".format(low) + " " + unit + " to get in" if fit and total > fit else "") + "</div>", "s4"))
+    n = len(rows)
+    bars = [round(rows[int(i * (n - 1) / 6)][0], 1) for i in range(7)] if n >= 2 else []
+
+    return {"chips": chips, "steps": steps, "height": t["height"], "fit": fit, "total": total, "bars": bars, "top": top, "med": med, "low": round(low, 1)}
+
+
+FEE_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now();
+function $(i){return document.getElementById(i)}
+function nx(v){return Number(v).toLocaleString(undefined,{maximumFractionDigits:1})}
+function ease(u){u=Math.max(0,Math.min(1,u));return 1-Math.pow(1-u,3)}
+var ORDER=[3,0,5,2,6,1,4],P=7600,H=17;
+function bars(){var h='';D.bars.forEach(function(v,i){h+='<div class=fb data-i="'+i+'"><u>'+nx(Math.round(v))+'</u><i style="height:'+Math.max(10,Math.round(v/D.bars[0]*100))+'%"></i></div>'});$('fsbars').innerHTML=h;$('fscap').textContent=D.total.toLocaleString('en')+' unconfirmed transactions';$('fstop').textContent='~'+nx(Math.round(D.med))+' koinu/B'}
+function stepOn(n){[].forEach.call(document.querySelectorAll('.st'),function(e){e.classList.toggle('on',e.classList.contains('s'+(n+1)))})}
+function frame(now){var t=still?P*.7:(now-t0)%P,ph=t<1400?0:t<4600?1:t<6000?2:3,out=t>P-500?1-(t-(P-500))/500:1,els=document.querySelectorAll('#fsbars .fb'),w=$('fsbars').clientWidth/els.length;
+els.forEach(function(e,i){var k=ease((t-1400-i*320)/900),slot=ORDER[i]+(i-ORDER[i])*k,o=Math.min(1,t/400)*out;e.style.transform='translateX('+(slot*w).toFixed(1)+'px)';e.style.opacity=still?1:o;e.firstChild.style.opacity=k});
+stepOn(ph);if(!still)requestAnimationFrame(frame)}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/fee-sorting.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+D=d;$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';$('steps').innerHTML=d.steps;
+bars();$('upd').innerHTML='<i class=dot></i> live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+bars();setInterval(tick,5000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+
+def fee_page():
+    d = fee_parts()
+    left = ("<div class=fsstage><span class=fstop id=fstop></span><div class=fsbars id=fsbars aria-hidden=true></div><span class=fscap id=fscap></span></div>")
+    body = (hero("Fee sorting", d["chips"]) + other_pages("/fee-sorting")
+            + stage(left, d["steps"], "How your node fills the next block", "Miners take the transactions that pay the most per byte, not the most in total. This is the order your own node would use, and it changes as transactions arrive.",
+                    "The bars are the rates of your node's waiting transactions, sorting themselves from the highest down.")
+            + "<script>" + FEE_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Fee sorting", body, True)
+
+
+# ----- 2. Coinbase & merkle root -----
+
+def merkle_parts():
+    t = doge_template()
+    n = t["nleaves"]
+    chips = chips_of(t, "<span class=chip><b>" + "{:,}".format(n) + "</b> hashes</span>")
+    steps = (st("1", "The coinbase goes first", "the transaction that pays the miner: " + "{:,}".format(SUBSIDY // COIN) + " DOGE plus the fees (a stand-in hash until a miner builds the real one)",
+                "<div class=big2>" + "{:,.2f}".format(t["reward"] / COIN) + " <small>DOGE reward</small></div><div class=sub>coinbase hash <span class=mono>" + short(t["cb"], 6, 4) + "</span></div>", "s1")
+             + st("2", "Add the best-paying transactions", "the ones <a href='/fee-sorting'>fee sorting</a> picked, in that order",
+                  "<div class=big2>" + "{:,}".format(n - 1) + " <small>transactions</small></div><div class=sub>" + "{:,.1f}".format(t["size"] / 1000.0) + " kB · fees " + doge(t["fees"]) + "</div>", "s2")
+             + st("3", "Hash them in pairs", "each id twice through SHA-256, two by two, until one is left",
+                  "<div class=big2>" + "{:,}".format(n) + " hashes → 1</div><div class=sub>" + str(t["rounds"]) + " round" + ("" if t["rounds"] == 1 else "s") + (" · a lone hash is paired with itself" if n > 1 else "") + "</div>", "s3")
+             + st("4", "The merkle root", "one hash that stands for every transaction; it goes into the block header",
+                  "<div class='big2 mono'>" + short(t["root"], 12, 8) + "</div><div class=sub>change one transaction and the whole root changes · <a href='/block-assembly'>into the header</a></div>", "s4"))
+    short5 = lambda h: h[:5]
+    mk = {"n": n, "leaves": [short5(x) for x in t["leaves"]], "l1": [short5(x) for x in t["l1"]], "root": t["root"][:8]}
+    return {"chips": chips, "steps": steps, "height": t["height"], "root": t["root"], "mk": mk}
+
+
+MK_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now();
+function $(i){return document.getElementById(i)}
+function ease(u){u=Math.max(0,Math.min(1,u));return 1-Math.pow(1-u,3)}
+var P=9000,AT={leaf:[400,1500,2100,2700],la:3300,lb:3300,lc:3600,ld:3600,n0:3900,n1:4200,ra:5000,rb:5000,root:5500};
+function stepOn(n){[].forEach.call(document.querySelectorAll('.st'),function(e){e.classList.toggle('on',e.classList.contains('s'+(n+1)))})}
+function frame(now){var t=still?7000:(now-t0)%P,out=t>P-700?1-(t-(P-700))/700:1,M=D.mk,svg=document.querySelector('.mksvg'),gs=svg.querySelectorAll('.mk');
+for(var j=0;j<gs.length;j++){var g=gs[j],k=g.dataset.k,i=+(g.dataset.i||0),t0k=k==='leaf'?AT.leaf[i]:AT[k],has=true;
+if(k==='leaf')has=i<M.n;if(k==='n0')has=M.n>1;if(k==='n1')has=M.n>2;if(k==='la'||k==='lb'||k==='ra')has=M.n>1;if(k==='lc'||k==='ld'||k==='rb')has=M.n>2;
+var p=ease((t-t0k)/(g.tagName==='path'?600:450));
+if(g.tagName==='path'){g.style.strokeDasharray='1';g.style.strokeDashoffset=String(1-p);g.style.opacity=has?out:0;continue}
+g.style.opacity=has?p*out:0;g.setAttribute('transform','translate(0 '+((1-p)*-9).toFixed(1)+')');
+var v=g.querySelector('.v');if(v){var w=k==='leaf'?M.leaves[i]:k==='n0'?M.l1[0]:k==='n1'?M.l1[1]:M.root;if(w!==undefined&&v.textContent!==w)v.textContent=w}}
+var ph=t<3300?(t<1500?0:1):t<5300?2:3;stepOn(ph);var c=$('mkcap'),w=ph===0?'coinbase transaction':ph===1?'adding the best-paying transactions':ph===2?'hashing pairs':'merkle root';if(c.textContent!==w)c.textContent=w;
+if(!still)requestAnimationFrame(frame)}
+function more(){$('mkmore').textContent=D.mk.n>4?'the first four of '+D.mk.n.toLocaleString('en')+' hashes are drawn; the rest fold in the same way':''}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/coinbase-merkle.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+D=d;$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';$('steps').innerHTML=d.steps;
+more();$('upd').innerHTML='<i class=dot></i> live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+more();
+setInterval(tick,5000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+
+def merkle_page():
+    d = merkle_parts()
+
+    def leaf(i, cls, tag):
+        x = 3 + i * 32
+        return ("<g class=mk data-k=leaf data-i=" + str(i) + "><text class=cap x=" + str(x + 14) + " y=3.5>" + tag + "</text><rect class='nd " + cls + "' x=" + str(x) + " y=8 width=28 height=13 rx=2 />"
+                "<text class=v x=" + str(x + 14) + " y=15.3></text></g>")
+
+    def node(k, x, y, w, cls):
+        return "<g class=mk data-k=" + k + "><rect class='nd " + cls + "' x=" + str(x) + " y=" + str(y) + " width=" + str(w) + " height=13 rx=2 /><text class=v x=" + str(x + w / 2) + " y=" + str(y + 6.8) + "></text></g>"
+
+    def ln(k, x1, y1, x2, y2):
+        return "<path class='ln mk' data-k=" + k + " pathLength=1 d='M" + str(x1) + " " + str(y1) + "L" + str(x2) + " " + str(y2) + "'/>"
+    svg = ("<svg class=mksvg viewBox='0 0 130 82' aria-hidden=true focusable=false>" + ln("la", 17, 21, 33, 38) + ln("lb", 49, 21, 33, 38) + ln("lc", 81, 21, 97, 38) + ln("ld", 113, 21, 97, 38) + ln("ra", 33, 51, 65, 66) + ln("rb", 97, 51, 65, 66)
+           + leaf(0, "cb", "coinbase") + leaf(1, "tx1", "tx 1") + leaf(2, "tx1", "tx 2") + leaf(3, "tx1", "tx 3") + node("n0", 19, 38, 28, "l1") + node("n1", 83, 38, 28, "l1") + node("root", 41, 66, 48, "root") + "</svg>")
+    left = "<div class=mkstage><b class=mkt>Merkle tree</b>" + svg + "<span class=mkcap id=mkcap>coinbase transaction</span><span class=mkmore id=mkmore></span></div>"
+    body = (hero("Coinbase &amp; merkle root", d["chips"]) + other_pages("/coinbase-merkle")
+            + stage(left, d["steps"], "How the transactions become one hash", "Every transaction of the block is hashed, then the hashes are hashed in pairs until one is left: the merkle root. It is what the block header holds of the transactions.",
+                    "The values are from your node. The coinbase hash is a stand-in: the real coinbase only exists once a miner builds it.")
+            + "<script>" + MK_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Coinbase and merkle root", body, True)
+
+
+# ----- 3. Block assembly -----
+
+HDR = [("Version", 4, "#4a78c9"), ("Previous block", 32, "#7a6cd6"), ("Merkle root", 32, "#1bd8f4"), ("Time", 4, "#2fb585"), ("Bits", 4, "#d9a21b"), ("Nonce", 4, "#e8ebf5")]
+
+
+def assembly_parts():
+    t = doge_template()
+    n = len(t["txs"])
+    chips = chips_of(t, "<span class=chip>not mined yet</span>")
+    bar = "<div class=bytebar>" + "".join("<i style='flex:" + str(sz) + ";background:" + c + "'></i>" for _, sz, c in HDR) + "</div>"
+    legend = "<div class=legend2>" + "".join("<span class=lg><i style='background:" + c + "'></i>" + k + " <em>" + str(sz) + " B</em></span>" for k, sz, c in HDR) + "</div>"
+    steps = (st("1", "Pick the transactions", "the best fee per byte that fit the block · <a href='/fee-sorting'>fee sorting</a>",
+                "<div class=big2>" + "{:,}".format(n) + " <small>transactions</small></div><div class=fill><i style='width:" + "{:.0f}".format(min(100, t["size"] / t["limit"] * 100)) + "%'></i></div>"
+                "<div class=sub>" + "{:,.1f}".format(t["size"] / 1000.0) + " kB of " + "{:,}".format(t["limit"]) + " B · fees " + doge(t["fees"]) + "</div>", "s1")
+             + st("2", "Fold them into a merkle root", "<a href='/coinbase-merkle'>coinbase &amp; merkle root</a> · " + "{:,}".format(t["nleaves"]) + " hashes, " + str(t["rounds"]) + " rounds",
+                  "<div class='big2 mono'>" + short(t["root"], 12, 8) + "</div><div class=sub>" + "{:,}".format(t["nleaves"]) + " hashes → 1 root</div>", "s2")
+             + st("3", "Add the coinbase", "pays whoever finds the block: the flat subsidy plus every fee",
+                  "<div class=big2>" + "{:,.2f}".format(t["reward"] / COIN) + " <small>DOGE</small></div><div class=sub>" + "{:,}".format(SUBSIDY // COIN) + " subsidy + " + doge(t["fees"]) + " fees</div>", "s3")
+             + st("4", "Write the 80-byte header", "what every miner hashes, over and over, with a new nonce each time",
+                  bar + legend, "s4"))
+    rows = [("Version", 4, "0", "0x{:08x}".format(t["version"] & 0xFFFFFFFF) + " (" + "{:,}".format(t["version"]) + "): bit 8 flags a merge-mined (AuxPoW) block, the top 16 bits are Dogecoin's chain id 0x0062", HDR[0][2], t["hdr"][0:8]),
+            ("Previous block", 32, "4", "hash of block " + "{:,}".format(t["height"] - 1) + ", the block this one builds on", HDR[1][2], t["hdr"][8:72]),
+            ("Merkle root", 32, "36", "one hash of the coinbase and all " + "{:,}".format(n) + " transactions", HDR[2][2], t["hdr"][72:136]),
+            ("Time", 4, "68", time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(t["time"])) + ": the miner may move it on while hashing", HDR[3][2], t["hdr"][136:144]),
+            ("Bits", 4, "72", "the target a hash must fall under" + ("" if t["bitsExact"] else " (the previous block's: your node sets it afresh for every block, so it moves a little)"), HDR[4][2], t["hdr"][144:152]),
+            ("Nonce", 4, "76", "0 here: the search through the nonce is the <a href='/block-candidate'>candidate block</a>", HDR[5][2], t["hdr"][152:160])]
+    trs = "".join("<tr><td class=sw><i style='background:" + c + "'></i></td><td>" + k + "</td><td class=r>" + str(sz) + "</td><td class=r data-b='" + b + "'>" + b + "</td><td class=why>" + why + "</td><td class='mono wrap'>" + hx + "</td></tr>" for k, sz, b, why, c, hx in rows)
+    colored = "".join("<span style='color:" + c + "'>" + hx + "</span>" for _, _, _, _, c, hx in rows)
+    details = ("<details><summary>The header, field by field</summary><div class=tbl><table class='rank fld'><tr><th></th><th>Field</th><th class=r>Bytes</th><th class=r>From byte</th><th>What it is</th><th>Value (hex)</th></tr>" + trs + "</table></div>"
+               "<div class='hexblob mono'>" + colored + "</div></details>")
+    return {"chips": chips, "steps": steps, "details": details, "height": t["height"], "root": t["root"], "ntx": n, "prev": t["prev"], "weight": t["size"], "limit": t["limit"], "reward": t["reward"] / COIN,
+            "ver": "0x{:08x}".format(t["version"] & 0xFFFFFFFF), "bits": t["bits"], "time": t["time"], "segs": [[sz, c] for _, sz, c in HDR], "total": 80}
+
+
+AS_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now(),last={ntx:D.ntx,root:D.root};
+function $(i){return document.getElementById(i)}
+function sh(h){return h.slice(0,6)+'…'+h.slice(-4)}
+function ease(u){u=Math.max(0,Math.min(1,u));return 1-Math.pow(1-u,3)}
+var HEX='0123456789abcdef',SS=[0,2600,5600,8200],TOT=12000,TXT=['picking transactions','folding the merkle root','adding the coinbase',''];
+function bar(){var h='';D.segs.forEach(function(s){h+='<i style="flex:'+s[0]+';background:'+s[1]+'"></i>'});$('abar').innerHTML=h}
+function scr(n){var o='';for(var i=0;i<n;i++)o+=HEX[(Math.random()*16)|0];return o}
+function stepOn(n){[].forEach.call(document.querySelectorAll('.st'),function(e){e.classList.toggle('on',e.classList.contains('s'+(n+1)))})}
+function frame(now){var t=still?10600:(now-t0)%TOT,ph=0;while(ph<3&&t>=SS[ph+1])ph++;
+var out=still?1:Math.max(0,Math.min(1,(TOT-t)/400)),rows=document.querySelectorAll('.cbrows .r');
+var pick=ease((t-200)/2000),n=Math.round(pick*D.ntx),kb=Math.round(pick*D.weight/1000);
+$('cbfill').style.height=(Math.min(100,D.weight/D.limit*100)*pick)+'%';$('cbfoot').textContent=still||t>=SS[2]?D.ntx.toLocaleString('en')+' tx · '+Math.round(D.weight/1000)+' kB':n.toLocaleString('en')+' tx · '+kb+' kB';
+var when=[SS[3]+100,SS[3]+400,SS[1]+150,SS[3]+700,SS[3]+1000,SS[3]+1300];
+for(var i=0;i<rows.length;i++){var u=still?1:ease((t-when[i])/450);rows[i].style.opacity=u*out;rows[i].style.transform='translateX('+((1-u)*-26)+'px)'}
+$('av').textContent=D.ver.slice(2);$('ap').textContent=sh(D.prev);$('atm').textContent=new Date().toISOString().slice(11,19);$('ab').textContent=D.bits;$('an').textContent='00000000';
+$('am').textContent=still||t>=SS[1]+1700?sh(D.root):scr(6)+'…'+scr(4);
+var segs=document.querySelectorAll('#abar i'),bytes=0;for(var q=0;q<segs.length;q++){var on=still||t>=SS[3]+200+q*380;segs[q].style.opacity=on?1:.12;if(on)bytes+=D.segs[q][0]}
+var rw=ph===2&&!still?D.reward*ease((t-SS[2]-150)/1400):D.reward;
+$('cbstate').textContent=ph<2?TXT[ph]:ph===2?'coinbase '+rw.toLocaleString('en',{maximumFractionDigits:0})+' DOGE':(bytes>=D.total?'ready · '+D.total+' B':bytes+' / '+D.total+' B');
+stepOn(ph);
+if(!still)requestAnimationFrame(frame)}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/block-assembly.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';
+var dt=$('details'),open=[].map.call(dt.querySelectorAll('details'),function(x){return x.open});
+$('steps').innerHTML=d.steps;dt.innerHTML=d.details;[].forEach.call(dt.querySelectorAll('details'),function(x,i){x.open=!!open[i]});
+D=d;bar();
+if(last.ntx!==d.ntx){var a=document.querySelector('.st.s1');if(a)a.classList.add('flash')}
+if(last.root!==d.root){var b=document.querySelector('.st.s2');if(b)b.classList.add('flash')}
+last={ntx:d.ntx,root:d.root};
+$('upd').innerHTML='<i class=dot></i> live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+bar();setInterval(tick,5000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+
+def assembly_page():
+    d = assembly_parts()
+    row = lambda lab, i: "<div class=r><i>" + lab + "</i><b id=" + i + "></b></div>"
+    left = ("<div class=cbwrap><div class=cbcube id=cbcube><div class=cbfront><div class=cbhead><i class=cbcoin></i><b id=cbstate>0 / 80 B</b></div>"
+            "<div class=cbrows>" + row("Version", "av") + row("Prev", "ap") + row("Merkle", "am") + row("Time", "atm") + row("Bits", "ab") + row("Nonce", "an") + "</div>"
+            "<div class=cbbar id=abar aria-hidden=true></div><div class=cbfill id=cbfill></div><div class=cbfoot id=cbfoot></div></div><div class=cbtopf></div><div class=cbside></div></div></div>")
+    body = (hero("Block assembly", d["chips"]) + other_pages("/block-assembly")
+            + stage(left, d["steps"], "The block your node would build right now", "Nobody has mined it yet. Four steps, top to bottom, give the block miners will start hashing.",
+                    "The block your node would build right now, put together as the page shows it. Nothing has been mined yet.")
+            + "<section class=card id=details>" + d["details"] + "</section>"
+            + "<script>" + AS_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Block assembly", body, True)
+
+
+# ----- 4. Candidate block -----
+
+def candidate_parts():
+    t = doge_template()
+    work = t["diff"] * 4294967296.0          # the tries a block takes on average (Scrypt, difficulty 1 = 2^32 tries)
+    rate = work / BLOCK_SECONDS
+    hv, hu = hashrate_text(rate)
+    since = max(0, int(time.time()) - t["last"])
+    chance = 1 - math.exp(-60.0 / BLOCK_SECONDS)
+    zeros = max(1, int(math.log(work, 16)))
+    pct = min(100, since / BLOCK_SECONDS * 100)
+    s1 = st("1", "The header is ready", "the block your node built, <a href='/block-assembly'>step by step</a>",
+            "<div class=big2>Block " + "{:,}".format(t["height"]) + "</div><div class=sub>" + "{:,}".format(len(t["txs"])) + " transactions · " + "{:,.1f}".format(t["size"] / 1000.0) + " kB · merkle root <span class=mono>" + short(t["root"], 8, 6) + "</span></div>", "s1")
+    s2 = st("2", "Miners change the nonce and hash", "every miner hashes the same header with different nonces (Scrypt, merge-mined with Litecoin)",
+            "<div class=big2>" + hv + " <small>" + hu + "</small></div><div class=sub>about what the whole network tries every second</div>", "s2")
+    s3 = st("3", "Look for a lucky hash", "the block is found when the hash falls under the target: about " + str(zeros) + " zeros at the start",
+            "<div class=big2>1 in " + "{:,.0f}".format(work) + "</div><div class=sub>tries win: that is the difficulty times 2³². The network adjusts it after every block so a block takes about " + str(BLOCK_SECONDS) + " seconds.</div>", "s3")
+    s4 = st("4", "Found? Pass it on", "the winner sends the candidate plus its nonce to the network, with the Litecoin proof that merge-mining adds (AuxPoW)",
+            "<div class=big2><span id=since>" + "{}:{:02d}".format(since // 60, since % 60) + "</span> <small>since the last block</small></div><div class=fill id=sfill><i style='width:" + "{:.0f}".format(pct) + "%'></i></div>"
+            "<div class=sub>About <b id=tries>–</b> tries by all miners since then, <span id=ratio>–</span> × the average. On average " + str(BLOCK_SECONDS // 60) + ":" + "{:02d}".format(BLOCK_SECONDS % 60)
+            + "; a block comes in the next minute with a chance of " + "{:.0f}".format(chance * 100) + "%.</div>", "s4")
+    chips = chips_of(t, "<span class=chip>hashing now</span>")
+    return {"chips": chips, "steps": s4 + s1 + s2 + s3, "height": t["height"], "last": t["last"], "work": work, "rate": rate, "zeros": zeros, "ntx": len(t["txs"]), "prev": t["prev"], "root": t["root"], "weight": t["size"], "limit": t["limit"]}
+
+
+CAND_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now(),found=0,nonce=0,last=D.last;
+function $(i){return document.getElementById(i)}
+function sh(h){return h.slice(0,6)+'…'+h.slice(-4)}
+function hx(v){return ('00000000'+(v>>>0).toString(16)).slice(-8)}
+function nf(v){var u=['','thousand','million','billion','trillion','quadrillion','quintillion'],i=0;while(v>=1000&&i<6){v/=1000;i++}return v.toLocaleString('en',{maximumFractionDigits:v>=100?0:1})+(u[i]?' '+u[i]:'')}
+var Z=D.zeros;function meter(k){var h='';for(var i=0;i<Z;i++)h+='<i'+(i<k?' class=on':'')+'></i>';$('cbmeter').innerHTML=h+'<em>'+k+' of '+Z+' zeros</em>'}
+function foot(){$('cbfoot').textContent=D.ntx.toLocaleString('en')+' tx · '+Math.round(D.weight/1000)+' kB';$('cbfill').style.height=Math.min(100,D.weight/D.limit*100)+'%'}
+function stepOn(n){[].forEach.call(document.querySelectorAll('.st'),function(e){e.classList.toggle('on',e.classList.contains('s'+(n+1)))})}
+function clock(){var s=Math.max(0,Math.floor(Date.now()/1000)-last),e=$('since');if(e)e.textContent=Math.floor(s/60)+':'+('0'+s%60).slice(-2);var f=document.querySelector('#sfill i');if(f)f.style.width=Math.min(100,s/60*100)+'%';
+var tr=s*D.rate,a=$('tries');if(a)a.textContent=nf(tr);var r=$('ratio');if(r)r.textContent=(tr/D.work).toFixed(1);$('cbt').textContent=new Date().toISOString().slice(11,19)}
+function fill(){$('cbh').textContent=D.height.toLocaleString('en');$('cbp').textContent=sh(D.prev);$('cbm').textContent=sh(D.root);foot();clock()}
+var PH=[2600,3800,3800,1800],TOT=PH.reduce(function(a,b){return a+b},0),TXT=['ready · 80 B','nonce +1 … hashing','compare with target','no luck · next try'];
+function frame(now){var t=still?2600:(now-t0)%TOT,ph=0,a=0;while(ph<3&&t>=a+PH[ph]){a+=PH[ph];ph++}
+if(!still&&found&&now<found){$('cbcube').classList.add('hit');$('cbstate').textContent='block found! next candidate'}else{if(found){found=0;t0=now;$('cbcube').classList.remove('hit')}
+$('cbstate').textContent=TXT[ph]}
+var rows=document.querySelectorAll('.cbrows .r');for(var i=0;i<rows.length;i++){var u=ph===0&&!still?Math.max(0,Math.min(1,(t-i*260)/420)):1;rows[i].style.opacity=u;rows[i].style.transform='translateX('+((1-u)*-26)+'px)'}
+stepOn(ph);
+if(ph===0&&!still){$('cbn').textContent='00000000';$('cbhash').textContent='—';meter(0)}
+else if(!still){if(((now/110)|0)!==frame.k){frame.k=(now/110)|0;nonce=(nonce+1000003+((Math.random()*4e6)|0))>>>0;var k=0;while(k<Z-1&&Math.random()<1/16)k++;var s='';for(var i=0;i<k;i++)s+='0';while(s.length<12)s+='0123456789abcdef'[(Math.random()*16)|0];
+$('cbn').textContent=hx(nonce);$('cbhash').innerHTML='<u>'+s.slice(0,k)+'</u>'+s.slice(k,12)+'…';meter(k)}}
+else{$('cbn').textContent='00000000';$('cbhash').textContent='7f3a91c4e8b2…';meter(1)}
+if(!still)requestAnimationFrame(frame)}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/block-candidate.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+if(d.height!==D.height){found=performance.now()+2600}
+D=d;last=d.last;Z=d.zeros;$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';$('steps').innerHTML=d.steps;fill();
+$('upd').innerHTML='<i class=dot></i> live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+fill();meter(0);setInterval(clock,1000);setInterval(tick,5000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+
+def candidate_page():
+    d = candidate_parts()
+    row = lambda lab, i, cls="": "<div class='r" + cls + "'><i>" + lab + "</i><b id=" + i + "></b></div>"
+    left = ("<div class=cbwrap><div class=cbcube id=cbcube><div class=cbfront><div class=cbhead><i class=cbcoin></i><b id=cbstate>ready · 80 B</b></div>"
+            "<div class=cbrows>" + row("Height", "cbh") + row("Prev", "cbp") + row("Merkle", "cbm") + row("Time", "cbt") + row("Nonce", "cbn") + row("Scrypt", "cbhash", " hs") + "</div>"
+            "<div class=cbmeter id=cbmeter aria-hidden=true></div><div class=cbfill id=cbfill></div><div class=cbfoot id=cbfoot></div></div><div class=cbtopf></div><div class=cbside></div></div></div>")
+    body = (hero("Candidate block", d["chips"]) + other_pages("/block-candidate")
+            + stage(left, d["steps"], "The block miners are hashing right now", "A candidate is a finished block header waiting for the right nonce. Miners try nonce after nonce until one Scrypt hash is low enough.",
+                    "The values are your node's. The nonce and hash are an illustration: your browser does not hash, only a miner's hardware does.")
+            + "<script>" + CAND_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Candidate block", body, True)
+
+
+MAX_CONNECTIONS = 256          # open connections at once; more get a quick "busy" answer instead of one more thread
+MAX_WS = 64                    # live (WebSocket) connections at once
+MAX_WS_FRAME = 65536           # bytes a visitor may send in one WebSocket message
+_ws_open = [0]
+
+
+class CappedServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+    _slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            return self.shutdown_request(request)
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "dogecoin-explorer"
+    protocol_version = "HTTP/1.1"
+    timeout = 30                  # a client that stops sending (slow-loris) is dropped after 30 s; live connections set their own
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", cache=0):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=" + str(cache) if cache else "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def json(self, obj, cache=0):
+        self.send(200, json.dumps(obj), "application/json", cache)
+
+    def do_GET(self):  # noqa: N802
+        path, _, query = self.path.partition("?")
+        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        try:
+            if path == "/api/v1/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                return self.websocket()
+            if path == "/api/v1/blocks":
+                return self.json([mempool_json(b) for b in last_blocks(10)], 10)
+            if path == "/api/v1/fees/mempool-blocks":
+                return self.json(_state["mempool"] or mempool_blocks(), 5)
+            if path == "/api/v1/mempool/top":
+                return self.json(mempool_top(), 8)
+            m = re.fullmatch(r"/api/v1/mining/pool/([a-z0-9-]+)/blocks", path)
+            if m:
+                return self.json(pool_blocks(m.group(1)), 30)
+            m = re.fullmatch(r"/api/v1/mining/block/([0-9]+|[0-9a-fA-F]{64})", path)
+            if m:
+                return self.json(block_mining(m.group(1)), 3600)
+            m = re.fullmatch(r"/api/v1/mining/period-blocks/([0-9]+)", path)
+            if m:
+                return self.json(period_blocks(int(m.group(1))), 30)
+            if path == "/api/v1/mining/next-block":
+                return self.json(next_block(), 10)
+            m = re.fullmatch(r"/api/v1/mining/(hashrate|pools|pool-hashrate|solo)/(\w+)", path)
+            if m:
+                data = _mining[m.group(1)].get(m.group(2))
+                if data is None:
+                    return self.send(503, json.dumps({"error": "Mining statistics are being computed from your node, try again in a minute"}), "application/json")
+                return self.json(data, 300)
+            for route, parts, build in (("/fee-sorting", fee_parts, fee_page), ("/coinbase-merkle", merkle_parts, merkle_page),
+                                        ("/block-assembly", assembly_parts, assembly_page), ("/block-candidate", candidate_parts, candidate_page)):
+                if path == route:
+                    return self.send(200, build())
+                if path == route + ".json":
+                    return self.json(parts())
+            if path == "/api/blocks/tip/height":
+                return self.send(200, str(rpc("getblockcount")), "text/plain", 5)
+            if path == "/":
+                return self.send(200, home())
+            if path.startswith("/block/"):
+                return self.send(200, block_page(path[7:]))
+            if path == "/verified":
+                return self.send(200, verified_page())
+            if path == "/api/v1/verified-addresses":
+                return self.json(list(VERIFIED.values()), 300)
+            if path.startswith("/api/v1/address/") and valid_address(path[16:]):
+                return self.json(address_balance(path[16:]), 30)
+            if path.startswith("/address/") and valid_address(path[9:]):
+                return self.send(200, address_page(path[9:]))
+            if path == "/search":
+                q = urllib.request.unquote(params.get("q", "").replace("+", " ")).strip()
+                if valid_address(q):
+                    return self.redirect("/address/" + q)
+                if q.isdigit():
+                    return self.redirect("/block/" + q)
+                if HEX64.fullmatch(q):
+                    try:
+                        rpc("getblockheader", q)
+                        return self.redirect("/block/" + q)
+                    except RpcError:
+                        pass
+                return self.send(404, page("Not found", "<h1>Nothing found</h1><p>Search for a block height, a block hash or a Dogecoin address.</p>"))
+            return self.send(404, page("Not found", "<h1>Not found</h1>"))
+        except (RpcError, ValueError) as exc:
+            if path.startswith("/api/") or path.endswith(".json"):
+                return self.send(502, json.dumps({"error": str(exc)}), "application/json")
+            return self.send(502, page("Error", "<h1>Something went wrong</h1><p class=err>" + html.escape(str(exc)) + "</p>"))
+
+    def redirect(self, to):
+        self.send_response(302)
+        self.send_header("Location", to)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def websocket(self):
+        if _ws_open[0] >= MAX_WS:
+            return self.send(503, json.dumps({"error": "too many live connections"}), "application/json")
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        sock = self.connection
+        sock.settimeout(120)
+        _ws_open[0] += 1
+        try:
+            while True:
+                head = self.rfile.read(2)
+                if len(head) < 2:
+                    break
+                op, ln = head[0] & 0x0F, head[1] & 0x7F
+                if ln == 126:
+                    ln = struct.unpack(">H", self.rfile.read(2))[0]
+                elif ln == 127:
+                    ln = struct.unpack(">Q", self.rfile.read(8))[0]
+                if ln > MAX_WS_FRAME:
+                    break
+                mask = self.rfile.read(4) if head[1] & 0x80 else b"\0\0\0\0"
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(self.rfile.read(ln)))
+                if op == 8:
+                    break
+                if op == 9:
+                    with _send_lock:
+                        sock.sendall(bytes([0x8A, len(data)]) + data)
+                    continue
+                if op != 1:
+                    continue
+                try:
+                    msg = json.loads(data)
+                except ValueError:
+                    continue
+                if msg.get("action") == "want":
+                    with _clients_lock:
+                        _clients.add(sock)
+                    ws_send(sock, json.dumps({"blocks": [mempool_json(b) for b in last_blocks(8)], "mempool-blocks": _state["mempool"] or mempool_blocks()}))
+                elif msg.get("action") == "ping":
+                    ws_send(sock, json.dumps({"pong": True}))
+        except (OSError, RpcError, ValueError):
+            pass
+        finally:
+            _ws_open[0] -= 1
+            with _clients_lock:
+                _clients.discard(sock)
+            self.close_connection = True
+
+
+def main():
+    threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=mining_stats, daemon=True).start()
+    server = CappedServer(("0.0.0.0", PORT), Handler)
+    log("listening on port " + str(PORT))
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

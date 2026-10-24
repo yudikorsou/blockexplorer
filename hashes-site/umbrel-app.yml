@@ -1,0 +1,245 @@
+manifestVersion: 1
+id: hashes-site
+category: crypto
+name: hashes.space
+version: "1.9.214"
+tagline: The hashes.space Find Mempool page, served from your own Umbrel
+icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/hashes-site/icon.png
+description: >-
+  Serves the hashes.space pages straight from your Umbrel: the Find Mempool page, where you watch
+  blocks and the mempool of Bitcoin SHA-256, Bitcoin BLAKE2b, Monero and Dogecoin side by side.
+
+
+  Published on the internet (for example with the Cloudflare Tunnel app), the page streams blocks
+  live. Monero and Dogecoin come from your own full nodes through the Monero Explorer and Dogecoin
+  Explorer apps, so no third party sees what your visitors look at. Bitcoin SHA-256 is read from your own node through the Bitcoin Explorer app (btc.hashes.space), pruned
+  or not, with no third party behind it; Bitcoin BLAKE2b the same way, from your Bitcoin Knots node through the Bitcoin BLAKE2b Explorer
+  app (btcb2.hashes.space).
+
+
+  A browser can only reach these explorers from a real web page, which is why the page shows
+  simulated blocks in a preview or sandbox and live blocks once you serve it from here.
+developer: hashes.space
+website: https://hashes.space
+dependencies:
+  - monero
+  - bitcoin
+repo: https://github.com/yudikorsou/blockexplorer
+support: https://github.com/yudikorsou/blockexplorer/issues
+port: 4083
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: yudikorsou
+submission: https://github.com/yudikorsou/blockexplorer
+releaseNotes: >-
+  The fleet dashboard demo page is no longer part of this app.
+  The pages now load from the new public repository (yudikorsou/blockexplorer).
+  The fan logo is now the icon in the browser tab.
+  How to read (Bitcoin BLAKE2b): the blue DATUM/TIDES block now says Pool architecture: hybrid.
+  About hashes.space: a line in the middle of the page, Trustless proof-of-work systems, by ac (ac links to the LinkedIn page).
+  How to read the blocks: the Get DATUM Verified button under the blue DATUM/TIDES blocks and its page are removed.
+  The pool security audits (CONVOY, OCEAN, Omega Pool, Braiins Pool) are left out for now: the cards and the report pages are hidden.
+  Pool profile pages with a security audit (CONVOY, OCEAN, Omega Pool, Braiins Pool): the Back to the mining pools button is now at the top of the page.
+  Pool profile pages: the sentence "All blocks of the pool since the last difficulty adjustment ... live from ..." now sits directly under the search bar.
+  How to read (Bitcoin): the blue DATUM/TIDES block now says Pool architecture: hybrid.
+  Braiins Pool profile page (Bitcoin): the security assessment of 23 October 2026 (verdict and the 7 findings) is shown under the payout scheme, and Read the full report opens the whole report on a page of its own.
+  Omega Pool profile page (Bitcoin BLAKE2b): the security audit of 23 October 2026 (verdict and the 7 findings) is shown under the payout scheme, and Read the full report opens the whole report on a page of its own.
+  OCEAN profile page (Bitcoin): the security audit of 23 October 2026 (verdict and the 8 findings) is shown under the payout scheme, and Read the full report opens the whole report on a page of its own.
+  CONVOY profile page: the security audit of 22 October 2026 (verdict and the 9 findings) is shown under the payout scheme, and Read the full report opens the whole report on a page of its own, no download needed.
+  How to read the blocks: the blue DATUM/TIDES blocks (Bitcoin and Bitcoin BLAKE2b) have a Get DATUM Verified button with the DATUM Verified logo, leading to a new page to join the community.
+  How to read (every chain): every block type now shows its Pool architecture and Mempool filters.
+  Security: the pages fetched from the repository are only used when their SHA-256 matches the pinned one, and the server drops slow clients and caps connections.
+  Inside the miners (Bitcoin and Bitcoin BLAKE2b): the explanations follow the animations step by step, Block assembly now has three steps, and the block header is described as its 80 bytes.
+  Mining pools: the btcb2 pool is shown as a black hole again when it has mined blocks.
+  How to read the blocks: new Monero P2Pool explanation (a sharechain, reward paid in the coinbase transaction).
+  How to read the blocks: small wording fix in the Stratum V2 explanation.
+  How to read the blocks: reworded Stratum V2 (orange glow) explanation.
+  Blocks mined by Omega Pool now carry the DATUM/TIDES label (blue glow).
+  How to read the blocks: DATUM/TIDES payouts are described as non-custodial.
+  How to read the blocks: reworded Stratum V2 (orange glow) explanation.
+  How to read the blocks: reworded Centralised (red glow) explanation for Bitcoin and Bitcoin BLAKE2b.
+  How to read the blocks: new Centralised (red glow) explanation for Bitcoin and Bitcoin BLAKE2b.
+  How to read the blocks: the DATUM/TIDES explanation now names DATUM Gateway only.
+  How to read the blocks: new last sentence for the DATUM/TIDES explanation (custodial payouts via the TIDES algorithm).
+  How to read the blocks: the DATUM Only block is removed from the Bitcoin BLAKE2b explanations.
+  Stratum V2 blocks now have an orange glow and the label Stratum V2, with a new explanation on How to read the blocks.
+  DATUM Compatible blocks are now DATUM/TIDES: blue glow, new label and new explanation on How to read the blocks.
+  How to read the blocks: new text for the Decentralised (green glow) explanation on every chain.
+  How to read the blocks: the pool names under the example blocks are removed; the glow badge stays.
+  How to read the blocks: picking a chain now shows only that chain's glow explanations under The blockchain.
+  About hashes.space: the paper (the picture in the centre and the page that showed it) is removed; the page is empty again.
+  The language button and the site's own translations are taken out for now (the files stay in the project, not in the page). The page is much lighter again, and visitors translate it with their browser's own translation (Google Translate in Chrome), which is offered on the home page and stays on across the pages.
+  Pool profile pages: the logos beside the pool names are removed on every chain; the name stands alone again.
+  The browser's own translation (Chrome, Edge ...) works again, and is offered on the home page only. Once a visitor has translated the home page, the pages they open from it stay translated without another click. Visitors who land directly on another page, or who use the site's own language button, get no browser offer.
+  Browsers (Chrome, Edge ...) no longer offer to translate the page on every visit: the page is marked as not to be translated by the browser, since it has its own language button.
+  About hashes.space: the page that shows the paper no longer has a "Download the PDF" button; the paper is read on the page itself.
+  Language button next to Themes: it opens a pop-up over the blurred page with a spinning globe and a search bar; visitors type a language (in its own name or in English) and pick it, and the page is translated. 48 languages besides English (Spanish, French, German, Portuguese, Italian, Dutch, Swedish, Polish, Romanian, Greek, Russian, Ukrainian, Turkish, Arabic, Moroccan Arabic, Amazigh, Hindi, Bengali, Punjabi, Marathi, Tamil, Telugu, Urdu, Pashto, Simplified and Traditional Chinese, Cantonese, Japanese, Korean, Indonesian, Javanese, Filipino, Vietnamese, Thai, Swahili, Hausa, Yoruba, Igbo, Zulu, Amharic, Oromo, Quechua, Guaraní, Aymara, Nahuatl, Yucatec Maya, Papiamentu, Sranan Tongo). The first visit follows the browser language, and the pick is remembered. Names of products, pools and protocols stay as they are.
+  About hashes.space: the page now shows the first page of H. P. Luhn's paper "A new method of recording and searching information" in the centre. Click it to read the whole PDF on a page of its own.
+  Dogecoin solominers: every solo service with "4mr" in its name (G4mrr-solo, 44mrr-solo, E4mrr-solo ...) is now counted under 4mrr-solo, so its hashrate and percentage are added together.
+  New menu tab "About hashes.space" next to Find Mempool. The page is empty for now.
+  Phone: the Block assembly animation of Monero and Dogecoin now fits every field, including the merkle root, above the byte bar, with smaller type and tighter lines.
+  Phone: the Monero Fee-Per-Byte Ranking animation now also shows its full text (the fee range and the number of unconfirmed transactions) above its button, with slightly tighter rows so it fits.
+  Phone: the Fee Auction animation (Bitcoin and Bitcoin BLAKE2b) and the Fee Sorting animation (Dogecoin) now show their full text, the fee rates from highest to lowest and the number of unconfirmed transactions, as on the desktop.
+  New wording for the Omega Pool (blue glow, DATUM Only) explanation in the colour guide.
+  The blue glow (DATUM Only) explanation for Omega Pool has new wording and now sits under the green glow block on Bitcoin BLAKE2b.
+  Bitcoin BLAKE2b: blocks mined by Omega Pool now glow blue with a "DATUM Only" label, and the colour guide has a new blue glow block explaining it.
+  A mining pool page now shows the payout scheme of the pool (such as FPPS, PPLNS or TIDES) under the pool statistics, for the Bitcoin and Bitcoin BLAKE2b pools in our pool list.
+  Monero: the tag under P2Pool blocks now reads P2Pool instead of Decentralised, and the explanation says Monero nodes do not include filters for CSAM or illicit/illegal content.
+  The Decentralised (green glow) explanation in the colour guide now says blocks are "constructed by solominers".
+  New wording for the DATUM Compatible (orange glow) explanation in the colour guide: it now mentions the DATUM Gateway communication protocol, on Bitcoin (OCEAN) and Bitcoin BLAKE2b (CONVOY).
+  The Decentralised (green glow) block is now also in the colour guide for Monero and Dogecoin.
+  New wording for the Decentralised (green glow) explanation in the colour guide, on Bitcoin and Bitcoin BLAKE2b.
+  Braiins Pool blocks on Bitcoin now glow yellow with a "Stratum V2 Compatible" label, and the colour guide has a new yellow glow block explaining it.
+  The orange glow explanation now reads "DATUM Compatible (orange glow)" instead of "Stratum V2 or DATUM Compatible (orange glow)".
+  Mining pool pages on Dogecoin now show the pool logo beside the name for ViaBTC, AntPool, Luxor Labs, NiceHash, EMCD, Mining Dutch, Binance Pool and KuPool, with transparent backgrounds.
+  The DxPool and CONVOY logos now sit beside the pool name on their mining pool pages on Bitcoin BLAKE2b, with transparent backgrounds.
+  The Foundry USA logo now sits beside its name on its mining pool page on Bitcoin.
+  The Braiins logo beside its pool name is now smaller so it fits like the other pool logos.
+  Mining pool pages on Bitcoin now show the pool logo beside the name for ViaBTC, AntPool, SpiderPool, MARA, Luxor, OCEAN, BTC.com, Braiins and Binance Pool, with transparent backgrounds.
+  The F2Pool logo now sits beside the name on its mining pool page on Bitcoin, Bitcoin BLAKE2b and Dogecoin.
+  Phone: on a mining pool's page the blocks no longer run into each other: a long badge such as Datum Compatible now wraps inside its block instead of widening it, which had pushed the cube out of place and under the next block.
+  Phone: in the information of a mined block, the payout addresses now wrap inside the box with their amount underneath, instead of running out of it.
+  The Blockchain on Find Mempool now holds every block since the last difficulty adjustment: Bitcoin and Bitcoin BLAKE2b back to the first block of the current 2016-block period, Dogecoin and Monero (which adjust at every block) the last day. Swipe back and older blocks load as you go; searching a block height in that range loads it and scrolls to it.
+  Phone: tapping the search bar (or any text field) no longer zooms the page in; the page stays as it is while you type.
+  Phone: the "Next block in approx." line with its timer now sits centred under the animations and the blocks.
+  Fix: after switching to another coin, the "Next block in approx." line no longer shows the old chain's timer for a second: it changes while the page fades to the new chain, and waits for the new chain's own answer.
+  Main page: a line under "Inside the miners" now says "Next block in approx." with a timer counting down to the next block. It uses each chain's own explorer (the pace of the last blocks against the difficulty of the next one); blocks are found by chance, so it is an average, not a promise. Dogecoin (DigiShield) and Monero (LWMA) count the next block at their own difficulty, which they set again at every block; Bitcoin and BLAKE2b use their 2016-block difficulty adjustment. Hover it for how it was worked out.
+  Main page: open mempool.hashes.space/#test-block to watch the block hash show of a mined block at once and again every 14 seconds (a made-up block that is taken away again; nothing else changes), without waiting for a real block.
+  Fix: the block hash animation of a new block did not play when the node sent the new block inside its list of blocks (instead of as a block of its own), which is how your own explorers can send it. A higher tip on a live chain now always counts as a new block.
+  Fix: on a live chain the block hash animation of a new block could be cut off, because the page draws the blocks again a few times when a block arrives (the new block then showed at once). The show now carries on through those redraws.
+  Main page: when a new block is mined, its block hash (with the leading zeros lit up) now comes out of the fan, moves to the new block, falls apart into its characters, and these build the block, on the web version and on phones.
+  Phones: the block number under "Hashing now on" now sits in the same plate, with the same lining and size, as the numbers on the mined blocks; the animations, the fan and the blocks keep their places.
+  Web version: the block number under "Hashing now on" now sits in the same plate, with the same lining and size, as the numbers on the mined blocks of "The blockchain"; the animations and blocks keep their places.
+  Phones: the fan is a little smaller and sits exactly in the middle between "Inside the miners" and "The blockchain", level with the blocks.
+  Main page: the block number under "Hashing now on" now sits in a small plate like the numbers on the mined blocks, without moving the animations, the fan or the blocks.
+  Phones: the fan between "Inside the miners" and "The blockchain" is 3D again, tilted and spinning like on the web version. The version line at the bottom of the page is gone again.
+  Phones: "The blockchain" now shows two blocks next to the fan, with the fan between the two sections, all in view when the page opens (swipe the blocks for older ones).
+  Phones: "Inside the miners", the fan and the first block of "The blockchain" now all fit on the screen at once, each as big as the phone width allows (a little bigger than before), with the fan in the middle between the two sections.
+  Phones: "Inside the miners" now stays in place (only the blocks of "The blockchain" swipe), and the fan is flat and spins around its own centre, which works reliably on iPhone.
+  Phones: the strip is sized again for wider phones, so the animations, the fan and the newest block of "The blockchain" are all in view when the page opens.
+  Phones: the strip is a little smaller again so the newest block of "The blockchain" is already in view when the page opens; swipe sideways for the rest.
+  Phones: the strip "Inside the miners" and "The blockchain" stays one row but is now much bigger (about 70% larger) and swipes sideways.
+  Dogecoin pool profiles: a payout transaction now says how many miners were paid and the real total they received; the change that goes back to the pool's own wallet is listed apart (and left out of the total).
+  Dogecoin pool profiles: in the Mining card the first payout transaction of the block now opens by itself, so the addresses that received a pool payout show at once.
+  Fix: the blocks of a Dogecoin pool did not show on its pool profile (the page stopped on a block that came without a fee). They now load from the Dogecoin Explorer.
+  Dogecoin pool profiles: the page asks the Dogecoin Explorer again while the pool's block list is still being read, so the blocks fill in.
+  Dogecoin pool profiles: the Mining card of a block now also shows a Payout transactions row: the pool's batch payouts inside that block, each opening to the list of addresses that received DOGE and how much.
+  Dogecoin pool profiles: a click on a block opens the Mining card with the payout addresses of that block (from your Dogecoin Explorer), like Bitcoin. Monero blocks still open the Monero Explorer, as Monero hides who is paid.
+  Dogecoin and Monero pool profiles: a block opens the block page of the Dogecoin Explorer or the Monero Explorer in a new tab (the Mining card is for Bitcoin and Bitcoin BLAKE2b), and the line under the blocks says so.
+  Bitcoin: the orange glow text now reads "Stratum V2 or DATUM Compatible (orange glow)".
+  Main page: clicking the Fee Auction block on Bitcoin and Bitcoin BLAKE2b opens the new Fee auction page of your own explorer, built from your node's mempool. Needs the updated Bitcoin / Bitcoin BLAKE2b Explorer apps.
+  Main page: clicking the Create new block block (Package sorting) on Bitcoin and Bitcoin BLAKE2b opens the new Package sorting page of your own explorer, built from your node. Needs the updated Bitcoin / Bitcoin BLAKE2b Explorer apps.
+  Main page: clicking the Block assembly block on Bitcoin (and Bitcoin BLAKE2b) opens the new Block assembly page of your own explorer, built from your node's block template. Needs the updated Bitcoin / Bitcoin BLAKE2b Explorer apps.
+  Main page: the Candidate block (Hashing now on ...) on the Bitcoin BLAKE2b chain now opens the block that is being hashed on mempool.guide (mempool.guide/mempool-block/0).
+  Main page: the Candidate block (Hashing now on ...) is now clickable on Bitcoin and opens the block that is being hashed on mempool.space (the next block of the mempool, mempool.space/mempool-block/0); on Litecoin it opens the same page on litecoinspace.org.
+  Mining pool page: the line under the blocks now says that clicking a block shows more information about the mined block.
+  Mining pool page: click a block of a pool and a Mining card opens under the blocks, in the site's design, with the pool, the coinbase text, who the reward was paid to, the reward and the transactions, plus a link to the full block page. Needs the updated Bitcoin / Bitcoin BLAKE2b explorer apps for the coinbase text and payout addresses.
+  How to read the blocks: the DATUM Compatible (orange glow) text now says "Miners mining with OCEAN get non-custodial payouts directly from the coinbase transaction" (CONVOY on the BLAKE2b chain).
+  Monero: the orange P2Pool block text now ends with "The blocks on P2Pool do not include filters for CSAM or illicit/illegal content." (hover text and the "How to read the blocks" page).
+  Monero: the text of the orange P2Pool blocks now explains that the block was mined on P2Pool, a decentralised pool where every miner runs their own Monero node and builds their own block, the reward is paid straight to all miners inside the block, and P2Pool blocks can include filters for CSAM or illicit/illegal content. Same text on the "How to read the blocks" page.
+  Monero: P2Pool blocks now glow orange (they were green), with an orange "Decentralised" label, and the P2Pool black hole is orange too. The "How to read the blocks" text says "Decentralised (orange glow)" for Monero.
+  How to read the blocks: the Decentralised (green glow) text now says the solominers or pools only accept miners that use Stratum V2 or DATUM Gateway with node software that includes filters for CSAM and other illicit/illegal content.
+  Bitcoin: blocks of Braiins Pool, DMND (DEMAND) and Solo CK now glow orange with a "Stratum V2 Compatible" label, and their black holes in the mining pools section glow orange too.
+  The Themes menu now opens on top of the page (before it opened behind the search bar and the blocks, so a theme could not be picked on a phone). The "Swipe for more blocks" hint is smaller on phones.
+  Phones: no more pop-ups on touch screens (the moon, the mining pools black holes and the hashrate chart no longer leave a box on the screen after a tap; mouse hover on a computer is unchanged). The pool names under the black holes have more room on a phone.
+  Phones: the strip is fixed for iPhone Safari (the text broke apart). The four animations of "Inside the miners", the fan and the blockchain now fit as a miniature, scaled to the width of the phone; "The blockchain" shows two blocks at a time and the others are a swipe away.
+  Phones: the strip with the four animations of "Inside the miners", the fan and the four newest blocks of "The blockchain" is now shown whole as a miniature, scaled to the width of the phone (360-448 px, as the iPhones and Androids of 6.1 inch and up), so nothing has to be swiped to see it.
+  The Academy tab is removed from the menu for now (the page is parked and comes back later). "How to read the blocks?" is unchanged.
+  How to read the blocks: the Monero Centralised (red glow) text now reads "A Monero block that is mined by a centralised pool. The reward is paid to a single address, the pool, which builds the block template and pays its miners as a third-party service."
+  How to read the blocks: the DATUM Compatible (orange glow) text now says the pool lets its miners build their own block templates with their own node, that miners get non-custodial payouts directly from the coinbase transaction, and that the pool is compatible with decentralised blocks yet can also be used by miners that do not create their own block templates.
+  How to read the blocks: the Decentralised (green glow) text now says these blocks are created by solominers or mining pools that only accept miners that use Stratum V2 or DATUM Gateway.
+  How to read the blocks: the Decentralised (green glow) text now says these blocks are created by miners that use Stratum V2 or DATUM Gateway, construct their own block templates by running their own node, and receive non-custodial payouts directly from the coinbase transaction.
+  How to read the blocks: the Centralised (red glow) text no longer starts with "Every other pool." and now begins "The pool builds the block template".
+  How to read the blocks: DATUM Compatible text now says the miners get non-custodial payouts "directly from the coinbase transaction".
+  How to read the blocks: the Decentralised (green glow) explanation on Bitcoin and Bitcoin BLAKE2b now reads "Decentralised blocks are blocks that are created by miners that construct their own block templates."
+  How to read the blocks: the DATUM Compatible (orange glow) explanation now says the pool lets its miners build their own block templates with their own node and a communication protocol called DATUM Gateway, while the miners get non-custodial payouts directly from the coinbase transaction.
+  How to read the blocks: the Centralised (red glow) explanation now reads "The pool builds the block template, so the pool decides which transactions go in and which stay out, and it pays out miners in the pool as a third-party service."
+  How to read the blocks: "Inside the miners" now follows the chain you came from, with the real four blocks of that chain and an animation each - Bitcoin and Bitcoin BLAKE2b (Fee auction, Create new block, Block assembly, Candidate block), Dogecoin (Fee sorting, Coinbase & merkle root, Block assembly with the 80-byte header, Candidate block) and Monero (Fee-per-byte ranking, Dynamic block size, Block assembly with the 76-byte header, Candidate block). Buttons on the page switch to another chain.
+  How to read the blocks now has two sections: "Inside the miners" (before the fan: Fee sorting, Coinbase & merkle root, Block assembly and Candidate block, each with a small animation) and "The blockchain" (behind the fan: the glow of the blocks per chain), with buttons to jump between them.
+  Picking another proof-of-work chain now switches smoothly: the blocks and the mining section fade out, swap while hidden and fade back in, and the section eases to the new chain's height instead of jumping. Rapid picks end on the last chain, and the fade is skipped for visitors who prefer reduced motion.
+  The "Get started solomining" button is now under the Solominers hashrate of every chain (Bitcoin, BLAKE2b, Dogecoin and Monero). Its page is empty for now (a header and a way back); the how-to comes later.
+  Monero Solominers: three parts instead of two - P2Pool miners (from the chain), large pools (as they report) and a Solominers estimate (the part left over) - with a "How is this worked out?" page (an equation, a stacked bar and the steps), and a new "Get started solomining" page that teaches how to solomine Monero: your own node, a wallet, pure solo or P2Pool with XMRig, and a calculator for your odds of finding a block. Needs Monero Explorer 0.18.5.1-24.
+  Monero gets the Solominers moon: P2Pool miners' share of the blocks, with their hashrate worked out at every block (difficulty / 120 s, LWMA), and a dedicated P2Pool solominers page (hashrate at every block, the latest P2Pool blocks with their payout splits, and the hashrate of the miners). Needs Monero Explorer 0.18.5.1-24.
+  View pool profile opens smoothly too: the pool page and its first blocks fade in, the "reading the blocks" line keeps its room so nothing jumps when it disappears, and the blocks start at the left and fill in as they are read instead of re-centring while the list grows.
+  More insights now opens smoothly: the page fades in and the black holes fade in once they are drawn at their new size, instead of showing stretched for a moment (also on the way back to the mempool).
+  The Candidate block animation shows only the strings of bits flying into the block: the circle and the glowing dots round it are gone.
+  The hashes flying into the Candidate block are now small strings of bits (0 and 1) instead of sparks.
+  Fix on the Dogecoin and Monero pages: sparks of the animated Candidate block no longer stay behind when the row moves or the block is drawn again, and the animation stays in the space round the block instead of covering the blocks beside it.
+  The label above the Candidate block is back to "Hashing now on <block height>". The miners all round the block and the hashes flying into it stay; the hashrate text is gone.
+  The two lines above the Candidate block use the same lettering as the old "Hashing now on" label (bold capitals with spacing); the unit stays H/s.
+  The line above the Candidate block now reads "<hashrate> hashing <block height>" with "miners all over the world" under it, in place of "Hashing now on <block height>"; the line under the block is gone.
+  Fix: the tags under the other blocks (Fee auction, Create new block, Block assembly) are back to their normal size; the hashrate line of the Candidate block no longer changes the height of the row.
+  The Candidate block now shows that miners all over the world are hashing it: a ring of miners glows round the block, hashes fly into it, a ring of light closes in, and a line under it gives the hashrate that is on the block right now.
+  Dogecoin: the Solominers and Mining pools sections (the moon and the black holes) are now based on DigiShield: the hashrate of each of the last 1,440 blocks is read from its own difficulty, and the solo miners and every pool get their share of those blocks times the median per-block hashrate. Needs Dogecoin Explorer 1.7.0 (older explorers keep the 14-day figures).
+  Fixed a console error ("drawImage ... a width or height of 0") from the Space theme background when the browser window was shrunk to nothing, for example with the developer tools docked over the page.
+  The moon of the solominers: the three lines of the list (Solo CK Pool, No pool tag or known payout address, Mining pools) are now three craters on the moon, one for each line, each in the colour of its line; hover or tap a crater for the hashrate and share of that source. On Bitcoin, when a block is found by Solo CK Pool or with no pool tag or known payout address (read live from your own node), the crater of that source lights up on the moon, with a ring that spreads out and a line under the moon saying which block it was.
+  The Solominers ring is now a moon: a detailed, slowly turning moon whose craters are open-pit mining sites (stepped pits with a haul road and amber rig lights, glowing most on the night side), lit by the sun of the Mining pools section so it has a bright side and a night side. The moon stands on its own, without a ring: the share of blocks found without a pool is the percentage under it, and the split is in the list below.
+  The sun from the Bitcoin mining pools now also shines on the Bitcoin BLAKE2b chain: the same animated sun hangs behind the mining pools in the Mining pools section and on the "Pick a mining pool" page of More insights, and lights the edge of each pool's black hole.
+  A mining pool's page now shows its blocks in one row that slides sideways, instead of a long list down the page: scroll sideways (or use the arrows) to reach every block the pool mined in the current difficulty period, with a line telling which blocks are in view. The same on every chain.
+  The Find Mempool page now opens on Bitcoin (SHA-256) instead of Bitcoin BLAKE2b; the other blockchains are one click away in the picker.
+  On Bitcoin and Bitcoin BLAKE2b the Solominers and Mining pools sections now follow the difficulty adjustment: the shares, the black holes, the picker, a pool's page and the hashrate of the pools and of the solo miners are worked out from the blocks mined since the last difficulty adjustment, read from your own Bitcoin node and Bitcoin Knots node, and the period starts over at the next adjustment (every 2016 blocks). The sections show the first block of the period and the block of the next adjustment. Update the Bitcoin Explorer (1.18.7) and the Bitcoin BLAKE2b Explorer (1.17.7) apps too; with an older explorer these sections keep showing the last month.
+  The "More insights" page (Pick a mining pool) no longer has the two links at the bottom ("Back to the mempool" and "Calculate hashrate"); the "Back to the mempool" button next to the search bar stays.
+  On the "More insights" page (Pick a mining pool) there is now a "Back to the mempool" button right next to the search bar, and the "Back to the mempool" link at the bottom of the page is gone.
+  On a mining pool's page the "Back to the mempool" link at the bottom is now a button right next to the block search bar (it reads "Back to the mining pools" when you came from the pick-a-pool page).
+  The "More insights" page (Pick a mining pool) no longer shows the blockchain picker and search bar above it either; the title, the sun and the black holes start right under the top bar. They come back on the other pages.
+  A mining pool's page (opened with "View pool profile") no longer shows the blockchain picker and search bar above it; the pool's name and blocks start right under the top bar. They come back when you leave the pool page.
+  A mining pool's page now shows a loading bar (orange to blue, like the rest of the page) with the number of blocks read so far while your explorer is still reading the pool's blocks. It disappears when all blocks are in.
+  On a mining pool's page the "Miners named in its blocks" list is gone; a search bar sits in its place and finds a block of that pool by its height or its hash (the blocks narrow down as you type).
+  A mining pool's page now shows every block the pool mined since the last difficulty adjustment (not a fixed 14 days), on Bitcoin and Bitcoin BLAKE2b. Each time a new difficulty adjustment starts (every 2016 blocks) the page starts over with the new blocks of that period. Update the Bitcoin Explorer (1.18.6) and the Bitcoin BLAKE2b Explorer (1.17.6) apps too.
+  A mining pool's page now shows every block the pool mined in the last 14 days (all of them, not just the latest 40) as miniature mined blocks, on Bitcoin and Bitcoin BLAKE2b. It fills in while your explorer reads the blocks, so update the Bitcoin Explorer (1.18.5) and the Bitcoin BLAKE2b Explorer (1.17.5) apps too. Without the update you still see the pool's latest blocks.
+  A mining pool's page (opened with "View pool profile") now shows every block of the pool as a miniature of the animated mined block: the same 3D block with its height plate, median fee and fee range, size, transactions, age, the pool name and the DATUM label. A block opens its page on your explorer, as in the strip.
+  The "More insights" button in the mining pool hashrate section now opens a page of its own where you pick a mining pool as a black hole. Only the pools of the blockchain you are on stand there (Bitcoin pools from your Bitcoin node, BLAKE2b pools from your Bitcoin Knots node and explorer, Dogecoin from your Dogecoin node, Monero from your Monero node), each as a hole in a tidy row, sized by its hashrate and standing perfectly still while only the matter around it circles. Under each hole: the pool name, its blocks and its hashrate, and a "View pool profile" button that opens the pool's page. The title, the intro text and the search bar sit right above the black holes, and on Bitcoin the animated sun hangs in the background on the right side of the page, shining down on the pools. Click a hole to see every block that pool mined; switch blockchain at the top to see another chain's pools, search a pool by name, and use the arrows for more pools.
+  The animated sun on the Bitcoin chain's mining pool hashrate section now looks like a real photograph of the sun: a deep orange surface covered in fine dark red and bright yellow mottling, white-hot active regions, a red glowing edge, slowly turning. It hangs far away in the background behind the black holes, lights the edge of each hole that faces it, and throws off sparks. Only on Bitcoin; it stands still when you prefer less motion.
+  The four blocks of the Dogecoin chain (Fee Sorting, Coinbase & Merkle Root, Block assembly, Candidate block) are clickable and open their own page on the Dogecoin Explorer.
+  The Monero chain no longer shows the "Mining pool calculator" button in the mining pools section.
+  On the Dogecoin chain the mining pools section now has a little spaceship with a Shiba Inu pilot that flies between the black holes (only on Dogecoin; it is decoration, not data).
+  On the Monero chain the four clickable blocks (Fee-Per-Byte Ranking, Dynamic Block Size, Block assembly, Candidate block) now show a small arrow on their label, and rise and light up when you hover over them.
+  On the Monero chain the Candidate block is now clickable: it opens the block candidate page of your Monero Explorer.
+  On the Monero chain the Block assembly block is now clickable: it opens the projected block page of your Monero Explorer.
+  On the Monero chain the Dynamic Block Size block is now clickable: it opens the live Dynamic Block Size page of your Monero Explorer.
+  On the Monero chain the Fee-Per-Byte Ranking block is now clickable: it opens the new fee-per-byte ranking page of your Monero Explorer, for the block that is being mined.
+  On the Monero chain the Block assembly animation now builds the miner (coinbase) transaction first and then the block header: major and minor version, timestamp, previous block, nonce and the merkle root, taken from your own Monero node when the Monero Explorer app is up to date.
+  On the Monero chain a new animation sits between the Fee-Per-Byte Ranking and the Block assembly, tagged Dynamic Block Size: the median of the recent block sizes (never below 300 kB), the effective limit of twice the median, and the penalty on the block reward for a block bigger than the median, which a transaction must out-pay with its fee.
+  On the Monero chain the first animation above the blocks is now a Fee-Per-Byte Ranking instead of a Fee Auction: the unconfirmed transactions are ranked by their fee rate, in nXMR per byte of transaction weight, from the highest down.
+  The Candidate block of Bitcoin and Bitcoin BLAKE2b now follows on from the Block assembly: it shows the finished header (version, previous block, merkle root, time, bits and nonce), slides in again when the assembly is ready and keeps trying nonces. The assembly now also shows the merkle root being built.
+  On the Bitcoin and Bitcoin BLAKE2b chains the Block assembly animation now shows how the block template is made: the coinbase transaction and block reward first, then the best packages are selected one after the other, each is checked against the block limits (one is skipped because it does not fit), and the selection is finalized.
+  On the Dogecoin chain the Candidate block follows on from the Block assembly: the finished 80-byte header (version, previous block, merkle root, time, bits) is shown ready, slides in again each time the assembly completes, and the nonce and its scrypt result keep changing while it is hashed.
+  On the Dogecoin chain the Block assembly animation now builds the 80-byte block header: version, previous block, merkle root, time, bits and nonce fly in one after the other and fill the 80 bytes.
+  On the Dogecoin chain the second animation above the blocks is now Coinbase & Merkle Root: the coinbase transaction is built, the best-paying transactions of the mempool come in, and they are hashed in pairs up to the merkle root.
+  On the Dogecoin chain the first animation above the blocks is tagged Fee Sorting instead of Fee Auction.
+  The page, the apps and the docs no longer name any third-party mempool site: Bitcoin and Bitcoin BLAKE2b blocks come only from your own explorers, and the block links open them.
+  The Bitcoin BLAKE2b blocks come only from your own Bitcoin BLAKE2b Explorer, and the block links open it.
+  The View more link is gone from the mining pools sections, and for Bitcoin BLAKE2b too the pools, hashrate and difficulty come only from your own nodes, and the sections stay hidden until your node answers.
+  The mining pools black holes glow like the labels under the mined blocks: red for a centralised pool, orange for OCEAN on Bitcoin and CONVOY on Bitcoin BLAKE2b, and on Monero green for P2Pool and red for the rest.
+  The top of every block now leans the same way as its shaded side, so the blocks look like solid boxes seen from the right.
+  The shaded side of every block is filled with the same colour as the block, a shade darker, so the side fills up with the block.
+  All blocks, the ones being built and the mined ones, now show their shaded side on the right.
+  The blocks being built before the fan (Block assembly and Candidate block) now show their shaded side on the right.
+  On the Monero chain the sections swap places: How blocks are paid out is on the left and the mining pools black holes on the right.
+  The Hashing now on label above the candidate block is set at the normal size instead of small, and it is centred over the block without moving it.
+  The label above the candidate block now reads Hashing now on followed by the height of the block being hashed.
+  The BTCB2 pool is no longer shown among the mining pools black holes.
+  The order before the fan is now Fee Auction, Create new block (the package sorting animation), Block assembly and Candidate block.
+  A new first step before Fee Auction, tagged Create new block: an animation of ancestor/descendant package sorting. A parent that pays little is grouped with the child that pays well, each package gets the fee rate of the whole, and the best-paying packages go into the block first.
+  On wide desktop screens Fee Auction, Block assembly and Candidate block are spread over the whole space before the fan, with Inside the miners centred above them, so no empty room is left on the left.
+  On wide desktop screens the blocks are bigger and spaced further apart, so Fee Auction, Block assembly and Candidate block fill their side of the fan.
+  On a wide desktop screen the block row grows with the window, so the blocks fill the page instead of sitting small in the middle.
+  The site now fetches its newest page straight from the repository, past GitHub's five-minute cache, so a new version shows up right after the app starts.
+  The black holes on the next pages of mining pools are drawn as big as on the first page, so every page is easy to read. The hashrate under each name is still the real figure.
+  The mining pools black holes show six pools at a time, biggest first, with arrows for the next six. OCEAN and CONVOY each get their own black hole. The Solominers heading and the headline sizes now match Inside the miners.
+  Bitcoin hashrate by country is gone: Bitcoin, BLAKE2b and Dogecoin now show the hashrate of solo miners (miners that use no pool) next to the mining pools, read from your own explorers. Update those apps too.
+  The hashrate section now has black holes, one per mining pool, sized by hashrate: hover one for its name and the hashrate it contributes. Built from your own nodes' pool statistics on all four chains. The View hashrate mining pools page is gone and the calculator button is now More insights.
+  The hashrate section now shows the combined hashrate of the mining pools (14 days, 1 month, 6 months, 1 year) with their share of the network, read from the Bitcoin, Bitcoin Knots, Dogecoin and Monero explorers on your Umbrel. Update those apps too.
+  Fee Auction is now only data on the page, without a block around it, and Block assembly animates the block being built up: the coinbase first, then the transactions flying in by fee rate while the totals count up.
+  Two headlines on the Find Mempool strip: Inside the miners (the blocks before the fan) and The Blockchain (the mined blocks). The block being hashed is labelled with its proof of work, and the three blocks before the fan show the real data of the block being hashed.
+  The proof-of-work and coin picker is now its own RAM module, separate from the search bar next to it, which still finds a block height or mining pool on the chosen chain. The first block is tagged Fee Auction.
+  The header block on the Find Mempool page now shows the merkle root, version, bits and time of the block being hashed, read from the explorer's block template, and a nonce that searches through its range.
+  The line between the blocks still to be mined and the mined blocks is now a spinning 3D fan: the blocks pass through it to the mined side.
+  While the explorer's node is still syncing, the chain shows simulated blocks and tries again every minute.
+  The Bitcoin BLAKE2b chain now streams from the new Bitcoin BLAKE2b Explorer app (btcb2.hashes.space), which reads blocks, fees,
+  mining pools and the mempool from your Bitcoin Knots app, pruned or not. While that explorer does
+  not answer or its node is still syncing, simulated blocks show. The Bitcoin SHA-256 chain streams from the new Bitcoin Explorer app (btc.hashes.space), which reads blocks, fees,
+  mining pools and the mempool from your Bitcoin Node app, pruned or not. While that explorer
+  does not answer or its node is still syncing, simulated blocks show. The Academy has seven chapter videos, one at a time with arrows.

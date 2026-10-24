@@ -1,0 +1,70 @@
+manifestVersion: 1
+id: hashes-monero-explorer
+category: crypto
+name: Monero Explorer
+version: "0.18.5.1-34"
+tagline: A Monero block explorer on your own Monero node
+description: >-
+  An Onion Monero Blockchain Explorer that reads every block and transaction straight from the
+  Monero Node app on your Umbrel: no third party sees what you look up.
+
+
+  It also serves the explorer's JSON API (/api/networkinfo, /api/transactions, /api/mempool …),
+  the same API xmrchain.net offers, so the hashes.space dashboard and its Find Mempool page can
+  stream Monero blocks from your own node. Publish it on the internet (for example with the
+  Cloudflare Tunnel app) to make it the Monero block explorer of your website.
+
+
+  Requires the Monero Node app, fully synced, on mainnet.
+developer: moneroexamples (explorer), hashes.space (Umbrel app)
+website: https://github.com/moneroexamples/onion-monero-blockchain-explorer
+dependencies:
+  - monero
+icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/monero.png
+repo: https://github.com/yudikorsou/blockexplorer
+support: https://github.com/yudikorsou/blockexplorer/issues
+port: 4081
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: yudikorsou
+submission: https://github.com/yudikorsou/blockexplorer
+releaseNotes: >-
+  Transaction page: the Decode outputs or prove sending section is gone.
+  Security: the server drops slow clients, caps connections and limits the size of requests passed to the explorer.
+  Block candidate page: the Look for a lucky hash step is gone.
+  Dynamic block size page: the What is this? explanation and The last 100 blocks chart are gone.
+  Dynamic block size page: the What it costs a transaction section (the transactions that lift a block over the median) is gone.
+  Block assembly page: the list of the leaves of the merkle tree (the transactions) is gone; the header, field by field, stays.
+  Fee-per-byte ranking page: the list of transactions (the find box, the table and Show all) is gone; the animation, the explanation and the totals stay.
+  Block candidate page: the builds on line (the previous block link) is gone from the header step.
+  New /api/v1/mining/next-block: the average wait for the next block, worked out from the pace of the last 360 blocks (newest weigh most, block timestamps) and the difficulty of the next block. It powers the "Next block in approx." timer on hashes.space.
+  New /api/v1/mining/pool/p2pool/blocks: the P2Pool blocks of the last day, one by one, so the P2Pool pool profile on hashes.space shows its blocks.
+  The Monero statistics now split the single-payout blocks by subtraction: the hashrate that SupportXMR, MoneroOcean, Nanopool, HeroMiners and HashVault publish on their own stats pages (fetched by the explorer every 10 minutes; one that does not answer is left out) is the large pools, and what is left of the network is solo miners and unlisted pools (an upper bound for solo). The explorer needs internet access for this.
+  New /api/v1/mining/(hashrate|pools|pool-hashrate|solo)/blocks and /api/v1/mining/p2pool/blocks: Monero retargets its difficulty (LWMA) at every block, so the explorer now reads the hashrate of each of the last 720 blocks (difficulty / 120 s) and splits it into the P2Pool miners (blocks whose coinbase pays several addresses) and everyone else, with the latest P2Pool blocks and their payout splits.
+  The four pages (/fee-ranking, /block-size, /block-assembly, /block-candidate) now work like the Dogecoin Explorer pages: a row of four choices at the top to jump between them, and the Fee-per-byte ranking and Dynamic block size pages open with an animated stage (the rates sorting themselves; the median, limit and penalty being drawn) beside four live steps, in the same glass design.
+  On the /block-assembly and /block-candidate pages the steps beside the animated block no longer fade in and out: all the text stays on screen and only the numbers change live as the node reports new data.
+  On the /block-assembly page the first two steps (pick the transactions, fold them into a merkle root) stay on screen instead of fading in and out beside the animated block; the miner transaction and header steps still appear in turn.
+  On the /block-candidate page the "Found? Pass it on" step (time since the last block) is now the first line under the intro text, always visible, with the other three steps animating in below it.
+  On the /block-candidate page the last step ("Found? Pass it on", with the time since the last block) now stays on screen instead of fading in and out beside the animated block.
+  The /block-assembly page now opens with an animated block being put together from the live block template: the transactions are picked and fill the block, the merkle root is folded, the miner transaction is added and the 76-byte header is written byte by byte, beside the four steps.
+  On the /block-candidate page the four steps lost their numbers: the text appears one step at a time, in step with the animated block, and starts over with every cycle.
+  The four pages made for the Find Mempool page (/fee-ranking, /block-size, /block-assembly, /block-candidate) share one lighter design: glass panels on a soft glow, quiet uppercase labels, hairline tables, and the steps as a timeline of numbered rings.
+  The /block-candidate page has a lighter glass design: the four steps beside the animated block are a quiet timeline (numbered rings joined by a line, the current step glowing) instead of dark boxes.
+  The /block-candidate page now opens with the animated candidate block: the header rows of the block being mined (height, previous block, merkle root, time) slide in, then the nonce counts and each try shows how many leading zeros of the hash it got against the zeros the difficulty needs, in step with the four steps next to it. The block turns green and the next candidate starts when a block is found.
+  New page /block-candidate: the block candidate of the block that is being mined, in four steps: the finished header, miners changing the nonce (network hashrate), the 1-in-difficulty lucky hash, and the time since the last block with the chance of a block in the next minute. It updates every 5 seconds.
+  New page /block-assembly: the block your node would build right now, before it is mined, in four steps on one screen: the transactions picked, the merkle root, the miner transaction reward and the 76-byte header drawn to scale. The header field by field (with hex) and the merkle tree leaves are one click away. It updates every 5 seconds and flashes the step that changes. /api/v1/block-template now picks the transactions that fit the effective median, like the ranking.
+  New page /block-size: a live view of the dynamic block size logic for the block that is being mined. The median of the last 100 blocks, the effective median and block limit, a chart of the last 100 block sizes, the penalty on the base reward with a slider, and what the next transactions cost in penalty. It updates by itself every 5 seconds (data also at /block-size.json).
+  The fee-per-byte ranking page (/fee-ranking) now updates by itself every 5 seconds: new transactions, the key figures, the ranking and the search result change as they enter the pool, without reloading the page. New /fee-ranking.json serves the same data.
+  New page /fee-ranking: the Fee-Per-Byte Ranking of the block that is being mined, with a simple explanation of what it is, the key figures, and the waiting transactions of your node ranked from the highest fee rate down, showing which ones fit in the next block. The Find Mempool page opens it from the first Monero block.
+  New /api/v1/block-template: the next block as your Monero node sees it (major and minor version, previous block, timestamp and the merkle root, Monero tree hash, of a stand-in miner transaction and the best-paying transactions of the pool). The Find Mempool page builds its Monero Block assembly animation from it.
+  Transaction pages (for example the miner reward transaction of a block) are in the same design: hash and block in a title row, key figures as tiles, and Details, Inputs and Outputs cards. The classic page with Decode outputs and Prove sending is one link away.
+  The block page is rebuilt in the design of the other hashes.space explorers: a title row with the payout type, time, confirmations and previous/next buttons, key figures as tiles, and Mining and Header cards. The transaction list is left out; every other page is still the Onion Monero Blockchain Explorer.
+  New /api/v1/mining/pool-hashrate/<period>: Monero blocks name no pool, so this is the hashrate of the P2Pool miners (the only pool whose blocks show on the chain): the network's hashrate times the share of P2Pool blocks.
+  The explorer now also serves the hashrate and payout-split statistics (/api/v1/mining/...) that the
+  hashes.space Find Mempool page shows for Monero, computed from your own Monero node.
+
+
+  The explorer now runs on Alpine Linux like the Monero Node app, so both can share the blockchain
+  database (it used to hang on start), and on any 64-bit Intel/AMD or ARM processor.

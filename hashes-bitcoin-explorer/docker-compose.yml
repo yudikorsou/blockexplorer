@@ -1,0 +1,31 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: hashes-bitcoin-explorer_web_1
+      APP_PORT: 3000
+      # a public block explorer: no Umbrel login in front of it (it is read-only)
+      PROXY_AUTH_ADD: "false"
+
+  web:
+    # the official Python image (the same one the other hashes.space apps use), running explorer.py: standard library only
+    image: python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+    user: "1000:1000"
+    restart: on-failure
+    init: true
+    environment:
+      HOME: /tmp
+      PORT: "3000"
+      # the Bitcoin Node app on this Umbrel (a pruned node is fine)
+      RPC_HOST: ${APP_BITCOIN_NODE_IP}
+      RPC_PORT: ${APP_BITCOIN_RPC_PORT}
+      RPC_USER: ${APP_BITCOIN_RPC_USER}
+      RPC_PASS: ${APP_BITCOIN_RPC_PASS}
+      # how far back the pool of each block is read (4320 blocks = 30 days; a pruned node keeps fewer blocks than that)
+      POOL_BLOCKS: "4320"
+    volumes:
+      - ${APP_DATA_DIR}/explorer.py:/app/explorer.py:ro
+      # the share of blocks mined by pools, per day: kept here so the 6-month and 1-year pool hashrate keeps growing on a pruned node
+      - ${APP_DATA_DIR}:/state
+    command: ["python3", "-u", "/app/explorer.py"]

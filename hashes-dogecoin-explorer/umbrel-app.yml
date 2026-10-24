@@ -1,0 +1,62 @@
+manifestVersion: 1
+id: hashes-dogecoin-explorer
+category: crypto
+name: Dogecoin Explorer
+version: "1.7.13"
+tagline: A Dogecoin block explorer on your own Dogecoin node
+icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/dogecoin.png
+description: >-
+  A light Dogecoin block explorer that reads every block and the mempool straight from
+  the Dogecoin Core app on your Umbrel: no third party sees what you look up. Search by block
+  height, block hash or address; merge-mined (AuxPoW) blocks show the pool that mined them.
+
+
+  It also offers mempool's API and WebSocket for Dogecoin (/api/v1/blocks,
+  /api/v1/fees/mempool-blocks, /api/v1/ws), so the hashes.space dashboard and its Find Mempool page
+  can stream Dogecoin blocks from your own node. Publish it on the internet (for example with the
+  Cloudflare Tunnel app) to make it the Dogecoin block explorer of your website.
+
+
+  Requires the Dogecoin Core app (doge-dogecoin-core), fully synced.
+developer: hashes.space
+website: https://hashes.space
+dependencies:
+  - doge-dogecoin-core
+repo: https://github.com/yudikorsou/blockexplorer
+support: https://github.com/yudikorsou/blockexplorer/issues
+port: 4082
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: yudikorsou
+submission: https://github.com/yudikorsou/blockexplorer
+releaseNotes: >-
+  Security: the server drops slow clients and caps connections and WebSocket messages.
+  No transactions are shown any more: the transaction page, the transactions of a block, the unspent coins of an address, the fee ranking list and the merkle hash list are gone (blocks, totals and the animations stay).
+  Block page: the block hash is now a clear card with a larger hash, a short explanation and a Copy button.
+  Block candidate page: the builds on line (the previous block link) is gone from the header step.
+  New /api/v1/mining/period-blocks/<height>: up to 15 blocks from that height down to a day back (1,440 blocks), with the fees and the pool of each, so the blockchain on hashes.space can show every block of the period. Update this app together with hashes.space.
+  New /api/v1/mining/next-block: the average wait for the next block, worked out from the pace of the last 480 blocks (newest weigh most, block timestamps) and the difficulty of the next block. It powers the "Next block in approx." timer on hashes.space.
+  Pool profiles: a payout transaction in the block lookup now separates the miners paid from the change that goes back to the sender, so the total is what the miners received.
+  Fix for 1.7.5, which left parts of the explorer out by mistake: this version has everything again. Also: after an update the pool tags of the last day are read first, so a pool profile on hashes.space gets its blocks within a minute or two instead of waiting for the week to be read.
+  Pool profiles: the blocks of a pool are now read in the background and answered as they come (no more waiting on the node for the whole list), and a failed read is written to the app log.
+  Fix: the blocks of a pool did not load on a Dogecoin pool profile (Dogecoin Core wants a true/false when its blocks are read, and the pool lookup sent a number).
+  Pool profiles: the block lookup now also lists the pool's payout transactions in the block (every transaction paying ten or more addresses, with each address and amount), next to the address the block reward went to.
+  New /api/v1/mining/block/<id>: one block's pool, coinbase text and every payout address with its amount, so a click on a block of a pool profile on hashes.space shows the payout addresses.
+  Block page: a new Paid to card lists every address the block reward was paid to (all outputs of the block's first transaction, with the amount and share of each, however many a pool pays).
+  New /api/v1/mining/pool/<pool>/blocks: the blocks a pool mined in the last day, so a Dogecoin pool profile on hashes.space shows the blocks of the pool (and a click on a block opens its details).
+  Mining statistics now follow Dogecoin's DigiShield: difficulty is retargeted at every block, so there is no difficulty period to count. The new period "blocks" (/api/v1/mining/{hashrate,pools,pool-hashrate,solo}/blocks) reads the last 1,440 blocks, takes each block's hashrate from its own difficulty (difficulty x 2^32 over the 60 s target), and gives every mining pool and the solo miners their share of those blocks times the median per-block hashrate.
+  Livestreams for verified organisations: an entry in VERIFIED_ADDRESSES can carry "streams" (a title and a https link each), for example a vegan animal food maker showing its food being packed. The organisation then gets a LIVE badge and a Watch live button on /verified, and a Live section with a player on its address page. YouTube (video or channel), Vimeo, Twitch and direct .m3u8 / .mp4 / .webm links play inside the page; any other https link opens on its own site. A stream only loads when the visitor presses play, so nothing is contacted before that.
+  The animated Doge spaceship (the Shiba Inu pilot from the Find Mempool page) now also flies in the background of the Verified donation addresses page, behind the cards. It stands still when your device asks for less motion.
+  Every address is now clickable (in the transaction flows and the transaction page) and opens a wallet page of its own at /address/<address>: the balance in DOGE read from your own node (the unspent coins it holds for that address, with the transaction, block and amount of each) behind a loading bar, a Copy button, and the organisation details when the address is verified. The first lookup of an address scans your node's unspent coins and can take up to a minute; it needs a Dogecoin Core that has scantxoutset.
+  Verified donation addresses: the explorer can mark the Dogecoin addresses of organisations that help animals and accept donations in DOGE. A verified address shows a green "Verified" label with the organisation, what it does and its website wherever it appears in a transaction, a transaction that pays one gets a "to <organisation>" chip on its block page, and every verified address is listed on a page of its own, /verified (a card per organisation with a search bar, a Copy button for the address and a link to its website; also linked from the header and the home page) (and as JSON on /api/v1/verified-addresses); searching an address opens its page. The list lives in VERIFIED_ADDRESSES at the top of explorer.py and ships empty: addresses are added after checking them on the organisation's own website.
+  Block and transaction pages now show how the coins move: every transaction of a block (the block reward paid to the miner is not listed: only the transfers between wallets) is drawn from the address it comes from, through the amount sent, to the addresses that receive it (full addresses and amounts), and coins that go back to the sender's own address are marked as change. A transaction page shows the same flow with its fee. The sending address is read from the transaction itself, so it works on any Dogecoin Core node; the amounts that came in and the fee need Dogecoin Core with -txindex=1 (or the transaction still being in the mempool).
+  Four new pages, one for each block of the Dogecoin chain on the Find Mempool page, all built from your own node: /fee-sorting (the waiting transactions ranked by fee per byte, with a finder), /coinbase-merkle (the coinbase and the merkle root, hashed pair by pair), /block-assembly (the 80-byte header put together beside an animated block) and /block-candidate (the nonce search, with the chance of a block). Each also as .json and live every 5 seconds. They use the getblocktemplate of Dogecoin Core when it answers and your mempool otherwise.
+  New /api/v1/mempool/top: the transactions that head the block being mined (best fee rate first). The Find Mempool page hashes them into a merkle root in its Coinbase & Merkle Root animation.
+  The block page has a structured layout: title row with the pool, time, confirmations and previous/next buttons, key figures as tiles and a Mining card. The transaction list is removed from the block page.
+  Housekeeping: wording in the code only.
+  New /api/v1/mining/solo/<period>: the hashrate of miners that use no pool, estimated from the blocks of solo services and the blocks with no known pool, times the network's hashrate (an upper bound). Blocks whose coinbase names none of the known pools count as solo.
+  The Find Mempool page's hashrate section now shows the combined hashrate of the mining pools (14 days, 1 month, 6 months, 1 year) instead of the whole network's: new /api/v1/mining/pool-hashrate/<period>, the network's hashrate times the share of blocks that pools mined. Over a long period the shares come from an evenly spread sample of the blocks.
+  Hashrate and mining pool statistics for 24 hours, 14 days, 1 month, 6 months and 1 year. Uses the Dogecoin Core app's real RPC password (fixes "HTTP 401"); unknown pools no longer show garbled names.
+  First release.

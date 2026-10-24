@@ -1,0 +1,2469 @@
+#!/usr/bin/env python3
+"""Bitcoin block explorer for Umbrel, on your own Bitcoin node (Python standard library only).
+
+One file for both Bitcoin chains: CHAIN=sha256 (the Bitcoin Node app, "Bitcoin Explorer" at btc.hashes.space) or
+CHAIN=blake2b (the Bitcoin Knots app on the BLAKE2b chain, "Bitcoin BLAKE2b Explorer" at btcb2.hashes.space).
+Reads everything from the node's RPC, pruned or not, and serves:
+
+  /                      the node's state, the latest blocks and the mempool
+  /block/<hash|height>   a block with its transactions (a block the pruned node no longer keeps is not listed)
+  /tx/<txid>             a transaction (mempool, a block you came from, or any tx with -txindex)
+  /search?q=             height, block hash or txid
+  /api/v1/blocks         the last blocks, in mempool's format, with the fees and the pool worked out from your node
+  /api/v1/fees/mempool-blocks   the blocks your mempool would build, best fee rate first
+  /api/blocks/tip/height
+  /api/v1/mining/hashrate/<period>  global hashrate and difficulty, from the block headers (24h, 14d, 1m, 6m, 1y; epoch: since the last difficulty adjustment)
+  /api/v1/mining/pools/<period>     blocks per mining pool, from the tags and payout addresses in each coinbase (period epoch: the blocks since the last difficulty adjustment)
+  /api/v1/mining/pool-hashrate/<period>  the hashrate of the mining pools together: the network's hashrate times the share of blocks that pools mined, per day
+  /api/v1/mining/solo/<period>      the hashrate of the miners that use no pool: blocks of solo services ("solo" in the pool's name) and blocks with no pool tag or known payout address, times the network's hashrate
+  /api/v1/mining/pool/<slug>/blocks   the latest blocks of one pool (the page's pool view); .../blocks/epoch: every block of the pool since the last difficulty adjustment, with fees
+  /api/v1/mining/block/<hash|height>  the pool information of one block: pool, coinbase text and who the reward was paid to (the pool page on hashes.space opens it)
+  /api/v1/difficulty-adjustment       where the chain is in its difficulty period, and the change the period is heading for
+  /api/v1/mining/period-blocks/<height>  up to 15 blocks from that height down to the first block of the difficulty period (the blockchain on hashes.space swipes back through them)
+  /api/v1/mining/next-block           when the next block is expected: the average wait, worked out from the pace of the last 288 blocks and the next block's difficulty
+  /api/v1/fees/recommended            fastest / half-hour / hour / economy / minimum fee rates, from your own mempool
+  /api/v1/halving                     blocks and time to the next halving
+  /api/v1/network                     the node: version, peers, mempool size and minimum fee, disk use, pruning
+  /api/v1/block/<hash|height>/stats   per-block statistics: fees, fee rates, SegWit and Taproot share, OP_RETURN, total sent
+  /api/v1/blocks/history              block size, fees and fee rates of the blocks the node keeps (the charts on the home page)
+  /api/v1/chain-tips                  chain forks and stale blocks (getchaintips); /forks is the page
+  /api/v1/tx/<txid>/projection        where a mempool transaction lands (block, ETA), its CPFP package and whether it can be replaced
+  /api/v1/address/<address>           balance and unspent outputs of one address (scantxoutset: slow, runs in the background, cached)
+  /fee-auction           the waiting transactions as bids: ranked by fee rate, where they land and the price of the next block (/fee-auction.json: the same as data)
+  /package-sorting       how your node fills the block: packages of transactions ranked by fee rate (/package-sorting.json: the same as data)
+  /block-assembly        the block your node would build right now: the coinbase, the picked transactions, the limits and the 80-byte header (/block-assembly.json: the same as data)
+  /api/v1/block-template              the header of the block being mined now (getblocktemplate): previous block, merkle root of the template, bits, time; the nonce stays null
+  /api/v1/ws             mempool's WebSocket: {"action":"want","data":["blocks","mempool-blocks"]}
+  /api/v1/status         what the explorer sees of the node (for when something does not show up)
+
+Fees are in sat/vB. The explorer refuses to serve (the page then shows simulated blocks) while the node is still syncing, because a node that is behind would show old blocks as live.
+"""
+
+import base64
+import hashlib
+import html
+import http.client
+import json
+import math
+import os
+import re
+import struct
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("PORT", "3000"))
+DAY = 86400
+WEEK = 7 * DAY
+YEAR = 365 * DAY
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+SUBSIDY0 = 50 * 100_000_000
+
+
+CHAIN = os.environ.get("CHAIN", "sha256")
+if CHAIN not in ("sha256", "blake2b"):
+    raise SystemExit("CHAIN must be sha256 or blake2b")
+# what differs between the two chains: the names, the ticker, the accent colour and where a block is opened when this node has pruned it
+CFG = {"sha256": {"name": "Bitcoin", "coin": "BTC", "accent": "#f7931a"},
+       "blake2b": {"name": "Bitcoin BLAKE2b", "coin": "BTCB2", "accent": "#e2b33c"}}[CHAIN]
+NAME, COIN = CFG["name"], CFG["coin"]
+
+
+def log(msg):
+    print("[" + CHAIN + "-explorer] " + msg, flush=True)
+
+
+# ---------- the node, the pool list, hashrate and pool statistics, the live blocks and the mempool blocks ----------
+
+HISTORY_BLOCKS = int(os.environ.get("HISTORY_BLOCKS", "288"))     # how many of the newest blocks the size and fee charts cover (two days)
+ADDRESS_SCAN = os.environ.get("ADDRESS_SCAN", "1") != "0"         # address balances (scantxoutset): one scan at a time, cached
+POOL_BLOCKS = int(os.environ.get("POOL_BLOCKS", "4320"))     # how far back the pool of each block is read: 30 days
+POOLS_URL = os.environ.get("POOLS_URL", "https://raw.githubusercontent.com/mempool/mining-pools/master/pools-v2.json")
+BTC_BLOCKS_PER_DAY = int(os.environ.get("BLOCKS_PER_DAY", "144"))        # both chains aim at ten minutes a block
+SOLO_RX = re.compile(r"solo", re.I)     # a pool whose name says it is a solo service
+POOL_WINDOWS = {"24h": DAY, "1w": WEEK, "14d": 14 * DAY, "1m": 30 * DAY}   # the periods the pool split is cut to
+EPOCH = 2016                 # one difficulty period: 2016 blocks, the stretch the difficulty is set over
+# tags to know when the public list cannot be fetched (and for chains it knows nothing about)
+FALLBACK_POOLS = [
+    ("Foundry USA", ["Foundry USA Pool"]), ("AntPool", ["AntPool"]), ("F2Pool", ["F2Pool", "\U0001F41F"]), ("ViaBTC", ["ViaBTC"]),
+    ("SpiderPool", ["SpiderPool"]), ("SECPOOL", ["SECPOOL"]), ("MARA Pool", ["MARA Pool"]), ("Luxor", ["Luxor"]),
+    ("OCEAN", ["OCEAN\\.XYZ"]), ("Braiins Pool", ["/slush/", "Braiins"]), ("NiceHash", ["NiceHash"]), ("BTC.com", ["BTC\\.COM"]),
+    ("Binance Pool", ["binance"]), ("CONVOY", ["convoy"]), ("BTCB2", ["btcb2"]), ("B2Pool", ["b2pool"]),
+]
+# The pools of the BLAKE2b chain, named the way the BLAKE2b chain's pools name themselves, by the text each puts in its coinbase (read from the
+# chain's last 600 blocks). The first tag that matches wins, so a pool's own name comes before the generic "DATUM Gateway" tag:
+# the blocks of a pool whose miners use a DATUM Gateway read "<pool> DATUM User". The SHA-256 pool list is not used for this chain.
+B2_POOLS = [("AlphaPool", ["alphapool"]), ("Lazarus", ["lazarus"]), ("B2Pool", ["b2pool"]), ("CONVOY", ["convoy"]),
+            ("DxPool", ["dxpool"]), ("Omega Pool", ["omegapool"]), ("RIPTIDE", ["riptide"]), ("PyBLOCK", ["pyblock"]),
+            ("Rabid Pool", ["rabid pool"]), ("sobig solo", ["sobig solo"]), ("Paperclip Pool", ["paperclippool"]),
+            ("Blockvase", ["blockvase"]), ("Bitcoin Xor", ["bitcoin xor"]), ("PCAA", ["pcaa"]), ("YUMM-SOLO", ["yumm-solo"]),
+            ("Pow.re", ["pow\\.re"]), ("Legata", ["legata"]), ("Quai Network", ["quai network"]), ("Tower7", ["tower7"]),
+            ("TrueNorth", ["truenorth"]), ("Tyger Pool", ["tyger pool"]), ("Mining-Dutch", ["mining-dutch"]),
+            ("In the name of God", ["in the name of god"]), ("555", ["deride and conquer"]), ("BTCB2", ["btcb2"]), ("DATUM User", ["datum gateway"])]
+
+
+class BtcRpc:
+    """A bitcoind-style JSON-RPC client (Bitcoin Core, Bitcoin Knots) over one kept-open connection."""
+
+    def __init__(self, host, port, user, password):
+        self.host, self.port = host, int(port)
+        self.auth = "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
+        self.conn, self.lock = None, threading.Lock()
+
+    def call(self, method, *params, timeout=60):
+        body = json.dumps({"jsonrpc": "1.0", "id": "hs", "method": method, "params": list(params)}).encode()
+        with self.lock:
+            for attempt in (1, 2):
+                try:
+                    if self.conn is None:
+                        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+                    self.conn.timeout = timeout
+                    self.conn.request("POST", "/", body=body, headers={"Authorization": self.auth, "Content-Type": "application/json"})
+                    r = self.conn.getresponse()
+                    status, data = r.status, r.read()
+                    break
+                except (http.client.HTTPException, OSError):
+                    try:
+                        self.conn and self.conn.close()
+                    except Exception:
+                        pass
+                    self.conn = None
+                    if attempt == 2:
+                        raise
+        if status == 401:
+            raise RuntimeError("the node refused the RPC login")
+        out = json.loads(data)             # an RPC error comes back as HTTP 500 with the error in the JSON
+        if out.get("error"):
+            raise RuntimeError(str(out["error"].get("message", out["error"])))
+        return out["result"]
+
+
+def bits_work(bits_hex):
+    """The hashes one block takes on average at this target (the compact 'bits' of a header)."""
+    b = int(bits_hex, 16)
+    exp, mant = b >> 24, b & 0x7FFFFF
+    target = mant << (8 * (exp - 3)) if exp > 3 else mant >> (8 * (3 - exp))
+    return (1 << 256) // (target + 1) if target > 0 else 0
+
+
+def percentiles(rates):
+    """[lowest, 10%, 25%, median, 75%, 90%, highest] of a list of fee rates, as mempool's feeRange."""
+    if not rates:
+        return [0, 0, 0, 0, 0, 0, 0]
+    r = sorted(rates)
+    at = lambda q: r[min(len(r) - 1, int(q * len(r)))]
+    return [r[0], at(.1), at(.25), at(.5), at(.75), at(.9), r[-1]]
+
+
+class PoolList:
+    """Which pool wrote a coinbase: payout addresses first, then the tags a pool puts in its coinbase text."""
+
+    def __init__(self):
+        self.addresses, self.tags, self.loaded = {}, [], False
+
+    def load(self):
+        entries = []
+        if CHAIN == "blake2b":
+            self.loaded, entries = True, [(n, t, []) for n, t in B2_POOLS]
+        else:
+            try:
+                req = urllib.request.Request(POOLS_URL, headers={"User-Agent": "hashes.space"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    for e in json.loads(r.read()):
+                        entries.append((e["name"], e.get("tags") or [], e.get("addresses") or []))
+                self.loaded = True
+            except Exception as exc:
+                log("pool list: " + str(exc) + " (using the short built-in list)")
+                entries = [(n, t, []) for n, t in FALLBACK_POOLS]
+            known = {n.lower() for n, _, _ in entries}
+            entries += [(n, t, []) for n, t in FALLBACK_POOLS if n.lower() not in known]
+        self.addresses, self.tags = {}, []
+        for name, tags, addrs in entries:
+            for a in addrs:
+                self.addresses[a] = name
+            for t in tags:
+                try:
+                    self.tags.append((re.compile(t, re.I), name))
+                except re.error:
+                    pass
+
+    @staticmethod
+    def miner_after(text, m):
+        """The miner a pool names in its coinbase: the printable text right after the pool's own tag ("AlphaPool", "Grumpy Pickle")."""
+        runs = [x for x in re.finditer(r"[\x20-\x7e]+", text)]
+        for k, run in enumerate(runs):
+            if run.start() <= m.start() < run.end():
+                if k + 1 < len(runs):
+                    cand = runs[k + 1].group().strip()
+                    if 2 <= len(cand) <= 40 and re.search(r"[A-Za-z0-9]{2}", cand) and cand.lower() not in run.group().lower() and m.group().lower() not in cand.lower():
+                        return cand
+                break
+        return ""
+
+    def find_full(self, coinbase_text, addresses):
+        """(pool, miner) of a coinbase"""
+        for a in addresses:
+            if a in self.addresses:
+                return self.addresses[a], ""
+        for rx, name in self.tags:
+            m = rx.search(coinbase_text)
+            if m:
+                miner = self.miner_after(coinbase_text, m)
+                return name, ("" if miner.lower() == name.lower() else miner)
+        return "Unknown", ""
+
+    def find(self, coinbase_text, addresses):
+        return self.find_full(coinbase_text, addresses)[0]
+
+
+POOLS = PoolList()
+
+
+SHARE_FILE = os.path.join(os.environ.get("STATE_DIR", "/state"), "pool-shares-" + CHAIN + ".json")
+
+
+def load_shares():
+    try:
+        with open(SHARE_FILE) as f:
+            return {int(d): [int(v[0]), int(v[1])] for d, v in json.load(f).items()}
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return {}
+
+
+def save_shares(days):
+    try:
+        tmp = SHARE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(d): v for d, v in sorted(days.items())[-400:]}, f)
+        os.replace(tmp, SHARE_FILE)
+    except OSError as exc:
+        log("pool shares cannot be kept on disk (" + str(exc) + "): the history then restarts with the node's readable blocks")
+
+
+class ChainStats:
+    def __init__(self, name, rpc):
+        self.name, self.rpc, self.lock = name, rpc, threading.Lock()
+        self.headers = {}                  # height -> (time, chainwork, hashes per block, difficulty)
+        self.pool_of = {}                  # height -> pool name
+        self.pool_rows = {}                # height -> the block as the pool view lists it
+        self.period_cache = {}             # height -> the block as period_blocks lists it
+        self.history = {}                  # height -> block size, fees and fee rates (getblockstats), for the charts
+        self.miner_of = {}                 # height -> the miner the pool names in the coinbase ("" when it names none)
+        self.share_day = load_shares()     # day number -> [blocks mined by pools, blocks that day]: kept on disk, so it outlives what a pruned node can still read
+        self.tip, self.fine, self.coarse, self.now = None, [], [], (0, 0)
+        self.ready, self.pruned_at, self.error = False, None, ""
+        self.live_blocks, self.live = {}, None     # block hash -> the block as shown; the latest live view
+        self.auction = None                # the mempool as bids for the fee auction page: counts, the best bids, the fee-rate bands and the first block
+
+    def header(self, h):
+        hit = self.headers.get(h)
+        if hit:
+            return hit
+        hd = self.rpc.call("getblockheader", self.rpc.call("getblockhash", h))
+        bits_w = bits_work(hd["bits"])
+        # the BLAKE2b chain's headers may carry no "difficulty": the hashes a block takes (from "bits") is what the page shows for it
+        hit = (int(hd["time"]), int(hd["chainwork"], 16), bits_w, float(hd["difficulty"]) if hd.get("difficulty") is not None else float(bits_w))
+        self.headers[h] = hit
+        return hit
+
+    def _series(self, heights):
+        hs, ds, last = [], [], None
+        for a, b in zip(heights, heights[1:]):
+            ta, wa, _, _ = self.header(a)
+            tb, wb, work, diff = self.header(b)
+            if tb > ta and wb > wa:
+                hs.append((tb, (wb - wa) / (tb - ta)))
+            d = work if self.name == "blake2b" else diff   # BLAKE2b: the hashes a block takes
+            if d != last:
+                ds.append((tb, d))
+                last = d
+        return hs, ds
+
+    def refresh_hashrate(self):
+        tip = int(self.rpc.call("getblockcount"))
+        step_f, step_c = 18, BTC_BLOCKS_PER_DAY                  # 3 hours for the month, a day for the year
+        grid = lambda step, n: sorted({max(1, (tip // step - i) * step) for i in range(n, -1, -1)} | {tip})
+        fine, coarse = self._series(grid(step_f, 30 * 8)), self._series(grid(step_c, 366))
+        a, b = self.header(max(1, tip - BTC_BLOCKS_PER_DAY)), self.header(tip)
+        rate = (b[1] - a[1]) / (b[0] - a[0]) if b[0] > a[0] else 0
+        with self.lock:
+            self.tip, self.fine, self.coarse = tip, fine, coarse
+            self.now = (rate, b[2] if self.name == "blake2b" else b[3])
+            self.ready = True
+        # forget what is out of reach, so the cache stays small
+        for h in [h for h in self.headers if h < tip - 400 * BTC_BLOCKS_PER_DAY]:
+            del self.headers[h]
+
+    def classify(self, h):
+        block_hash = self.rpc.call("getblockhash", h)
+        txid = self.rpc.call("getblock", block_hash, 1)["tx"][0]
+        tx = self.rpc.call("getrawtransaction", txid, True, block_hash)
+        text = bytes.fromhex(tx["vin"][0].get("coinbase", "")).decode("latin-1")
+        addrs = []
+        for o in tx.get("vout", []):
+            sp = o.get("scriptPubKey", {})
+            addrs += [sp["address"]] if sp.get("address") else (sp.get("addresses") or [])
+        self.header(h)
+        return POOLS.find_full(text, addrs)
+
+    def refresh_pools(self):
+        tip = self.tip
+        for h in range(tip, max(1, tip - POOL_BLOCKS) - 1, -1):    # newest first, so the day and the week are ready early
+            if h in self.pool_of:
+                continue
+            try:
+                self.pool_of[h], self.miner_of[h] = self.classify(h)
+            except Exception as exc:
+                if self.pruned_at is None:
+                    log(self.name + ": block " + str(h) + " cannot be read (" + str(exc) + "): the pool split covers the blocks from " + str(h + 1))
+                self.pruned_at = h
+                break
+        for h in [h for h in self.pool_of if h < tip - POOL_BLOCKS]:
+            del self.pool_of[h]
+            self.miner_of.pop(h, None)
+
+    # ---- every block of the difficulty period, for the blockchain on hashes.space: swipe back to the first block after the last adjustment ----
+    def period_view(self, h):
+        """one block of the current period as the page shows it (read lighter than block_view: the node's block statistics instead of every transaction)"""
+        hit = self.period_cache.get(h)
+        if hit:
+            return hit
+        try:
+            bh = self.rpc.call("getblockhash", h)
+            b = self.rpc.call("getblock", bh, 1, timeout=120)
+            cb = self.rpc.call("getrawtransaction", b["tx"][0], True, bh, timeout=120)
+            raw = cb["vin"][0].get("coinbase", "")
+            addrs = [o.get("scriptPubKey", {}).get("address") for o in cb.get("vout", []) if o.get("scriptPubKey", {}).get("address")]
+            pool = POOLS.find(bytes.fromhex(raw).decode("latin-1"), addrs)
+        except Exception:  # noqa: BLE001
+            return None                        # pruned, or the node is busy: left out for now
+        extras = {"medianFee": 0, "feeRange": [0, 0], "totalFees": 0}
+        try:
+            st = self.rpc.call("getblockstats", h, ["feerate_percentiles", "minfeerate", "maxfeerate", "totalfee"], timeout=120)
+            pc = st.get("feerate_percentiles") or [0, 0, 0, 0, 0]
+            extras = {"medianFee": pc[2], "feeRange": [st.get("minfeerate", 0), pc[0], pc[1], pc[2], pc[3], pc[4], st.get("maxfeerate", 0)], "totalFees": int(st.get("totalfee", 0))}
+        except Exception:  # noqa: BLE001
+            pass
+        extras["pool"] = {"name": pool}
+        extras["coinbaseRaw"] = raw
+        view = {"id": bh, "height": h, "timestamp": int(b["time"]), "tx_count": int(b["nTx"]), "size": int(b["size"]),
+                "weight": int(b.get("weight", int(b["size"]) * 4)), "extras": extras}
+        self.period_cache[h] = view
+        return view
+
+    def period_blocks(self, frm, limit=15, budget=8.0):
+        """up to `limit` blocks from height `frm` downward, never below the first block of the current period; what is not read within
+        `budget` seconds follows on the next request"""
+        tip = int(self.rpc.call("getblockcount"))
+        start = tip - tip % EPOCH
+        for h in [h for h in self.period_cache if h < start]:
+            del self.period_cache[h]
+        deadline, out, h = time.time() + budget, [], min(frm, tip)
+        while h >= start and len(out) < limit and (not out or time.time() < deadline):
+            v = self.period_view(h)
+            if v:
+                out.append(v)
+            h -= 1
+        return {"tip": tip, "periodStart": start, "blocks": out}
+
+    # ---- the live block stream: the newest blocks and the blocks the mempool would build, straight from the node ----
+    # The same shape as mempool's websocket ("blocks" and "mempool-blocks"), so the page reads either one.
+    def block_view(self, hash_):
+        """One block as the page shows it: size, fees (from the node's own undo data) and the pool that mined it."""
+        hit = self.live_blocks.get(hash_)
+        if hit:
+            return hit
+        b = self.rpc.call("getblock", hash_, 2, timeout=120)
+        txs = b["tx"]
+        cb = txs[0]
+        text = bytes.fromhex(cb["vin"][0].get("coinbase", "")).decode("latin-1")
+        addrs = []
+        for o in cb.get("vout", []):
+            sp = o.get("scriptPubKey", {})
+            addrs += [sp["address"]] if sp.get("address") else (sp.get("addresses") or [])
+        rates, fees = [], 0
+        for t in txs[1:]:
+            if "fee" in t and t.get("vsize"):
+                f = round(float(t["fee"]) * 1e8)
+                fees += f
+                rates.append(f / t["vsize"])
+        if not rates and len(txs) > 1:     # no undo data for this block: the fees are what the coinbase claims above the subsidy
+            subsidy = int(50e8) >> (int(b["height"]) // 210000)
+            fees = max(0, round(sum(float(o["value"]) for o in cb["vout"]) * 1e8) - subsidy)
+        view = {"id": b["hash"], "height": int(b["height"]), "timestamp": int(b["time"]), "tx_count": int(b["nTx"]),
+                "size": int(b["size"]), "weight": int(b["weight"]), "previousblockhash": b.get("previousblockhash"),
+                "extras": {"medianFee": percentiles(rates)[3], "feeRange": percentiles(rates), "totalFees": fees,
+                           "pool": {"name": POOLS.find(text, addrs)}, "coinbaseRaw": cb["vin"][0].get("coinbase", "")}}
+        self.live_blocks[hash_] = view
+        return view
+
+    def refresh_live_blocks(self):
+        if not POOLS.tags:
+            raise RuntimeError("the list of mining pools is still loading")
+        info = self.rpc.call("getblockchaininfo")
+        if info.get("initialblockdownload"):
+            raise RuntimeError("the node is still syncing")
+        tip, out = info["bestblockhash"], []
+        h = tip
+        while h and len(out) < 8:
+            v = self.block_view(h)
+            out.append(v)
+            h = v["previousblockhash"]
+        for k in [k for k in self.live_blocks if k not in {v["id"] for v in out}]:
+            if len(self.live_blocks) > 24:
+                del self.live_blocks[k]
+        return [{k: x for k, x in v.items() if k != "previousblockhash"} for v in out]
+
+    def refresh_live_mempool(self):
+        pool = self.rpc.call("getrawmempool", True, timeout=180)
+        items = []
+        for txid, e in pool.items():
+            v = e.get("vsize") or e.get("size") or 0
+            if not v:
+                continue
+            f = e.get("fees", {})
+            base = float(f.get("base", e.get("fee", 0))) * 1e8
+            # a transaction is mined together with the parents it needs and the children that pay for it:
+            # its worth to a miner is the best of its own rate and its packages' rates
+            rate = max(base / v, float(f.get("ancestor", 0)) * 1e8 / max(1, e.get("ancestorsize", v)),
+                       float(f.get("descendant", 0)) * 1e8 / max(1, e.get("descendantsize", v)))
+            items.append((rate, v, base, txid))
+        items.sort(key=lambda x: -x[0])
+        blocks, cur, size = [], [], 0
+        def flush():
+            rates = [r for r, _, _, _ in cur]
+            blocks.append({"nTx": len(cur), "blockVSize": size, "medianFee": round(percentiles(rates)[3], 2),
+                           "feeRange": [round(x, 2) for x in percentiles(rates)], "totalFees": round(sum(b for _, _, b, _ in cur))})
+        for it in items:
+            if size + it[1] > 1_000_000 and cur:
+                flush()
+                cur, size = [], 0
+                if len(blocks) >= 8:
+                    break
+            cur.append(it)
+            size += it[1]
+        if cur and len(blocks) < 8:
+            flush()
+        self.auction = auction_snapshot(items, blocks)
+        return blocks, len(pool)
+
+    def refresh_live(self):
+        blocks = self.refresh_live_blocks()
+        try:
+            mb, count = self.refresh_live_mempool()
+        except Exception as exc:           # blocks are still worth showing when the mempool cannot be read right now
+            log(self.name + " mempool: " + str(exc))
+            mb, count = (self.live or {}).get("mempoolBlocks", []), 0
+        with self.lock:
+            self.live = {"blocks": blocks, "mempoolBlocks": mb, "mempoolCount": count, "tip": blocks[0]["height"], "updated": int(time.time())}
+
+    def hashrate(self, period):
+        with self.lock:
+            if not self.ready:
+                raise RuntimeError("no data yet")
+            (fine_h, fine_d), (coarse_h, coarse_d), (rate, diff) = self.fine, self.coarse, self.now
+        span = {"24h": DAY, "14d": 14 * DAY, "epoch": 14 * DAY, "1m": 30 * DAY, "6m": 183 * DAY, "1y": YEAR}[period]
+        hs, ds = (fine_h, fine_d) if span <= 30 * DAY else (coarse_h, coarse_d)
+        cut = hs[-1][0] - span if hs else 0
+        if period == "epoch":              # since the last difficulty adjustment: the first block of the current 2016-block period
+            cut = self.header(max(1, self.tip - self.tip % EPOCH))[0]
+        if period == "14d":                # the last difficulty period (2016 blocks), not a fixed 14 days
+            cut = self.header(max(1, self.tip - EPOCH))[0]
+        keep = [x for x in hs if x[0] >= cut]
+        before = [x for x in ds if x[0] < cut][-1:]
+        return {"currentHashrate": rate, "currentDifficulty": diff,
+                "hashrates": [{"timestamp": t, "avgHashrate": v} for t, v in keep],
+                "difficulty": [{"time": t, "difficulty": d} for t, d in before + [x for x in ds if x[0] >= cut]]}
+
+    def refresh_history(self):
+        """block size, fees and fee rates of the newest HISTORY_BLOCKS blocks, newest first: a pruned node stops where its blocks end"""
+        tip = self.tip
+        for h in range(tip, max(1, tip - HISTORY_BLOCKS) - 1, -1):
+            if h in self.history:
+                continue
+            try:
+                st = self.rpc.call("getblockstats", h, ["time", "txs", "total_size", "total_weight", "totalfee", "feerate_percentiles", "swtxs", "total_out"], timeout=120)
+            except Exception:  # noqa: BLE001
+                break
+            self.history[h] = {"height": h, "timestamp": st["time"], "txs": st["txs"], "size": st["total_size"], "weight": st["total_weight"],
+                               "totalFees": st["totalfee"], "medianFeeRate": (st.get("feerate_percentiles") or [0, 0, 0])[2], "swShare": round(st["swtxs"] / st["txs"], 4) if st["txs"] else 0,
+                               "totalOut": st["total_out"]}
+        for h in [h for h in self.history if h < tip - HISTORY_BLOCKS]:
+            del self.history[h]
+
+    def history_rows(self):
+        with self.lock:
+            return [self.history[h] for h in sorted(self.history)]
+
+    def pool_blocks(self, slug, limit=40, epoch=False, budget=None):
+        """The latest blocks of one pool, in mempool's format (id, height, timestamp, tx_count, size, extras with the median fee and fee range).
+        epoch=True: every block of the pool since the last difficulty adjustment (the first block of the current 2016-block period), newest first;
+        when a new adjustment starts the list starts again from it. Blocks not read yet are read within
+        `budget` seconds and the rest follow on the next request, so a first request never hangs."""
+        with self.lock:
+            hs = {h: p for h, p in self.pool_of.items() if re.sub(r"[^a-z0-9]+", "-", p.lower()).strip("-") == slug}
+            top = max(self.pool_of) if self.pool_of else 0
+        heights = sorted((h for h in hs if not epoch or h >= top - top % EPOCH), reverse=True)
+        if not epoch:
+            heights = heights[:limit]
+        deadline = time.time() + budget if budget else None
+        out = []
+        for h in heights:
+            row = self.pool_rows.get(h)
+            if row is None or (epoch and "extras" not in row):
+                if deadline and time.time() > deadline:
+                    break
+                try:
+                    bh = row["id"] if row else self.rpc.call("getblockhash", h)
+                    if row is None:
+                        b = self.rpc.call("getblock", bh, 1, timeout=120)
+                        row = {"id": bh, "height": h, "timestamp": int(b["time"]), "tx_count": int(b["nTx"]), "size": int(b["size"]), "weight": int(b.get("weight", int(b["size"]) * 4))}
+                    if epoch:
+                        try:
+                            st = self.rpc.call("getblockstats", h, ["feerate_percentiles", "minfeerate", "maxfeerate"], timeout=120)
+                            pc = st.get("feerate_percentiles") or [0, 0, 0, 0, 0]
+                            row["extras"] = {"medianFee": pc[2], "feeRange": [st.get("minfeerate", 0), pc[0], pc[1], pc[2], pc[3], pc[4], st.get("maxfeerate", 0)]}
+                        except Exception:  # noqa: BLE001
+                            row["extras"] = {"medianFee": 0, "feeRange": [0, 0]}
+                except Exception:  # noqa: BLE001
+                    continue                       # pruned since: the block is simply left out
+                self.pool_rows[h] = row
+            out.append(row)
+        for h in [h for h in self.pool_rows if h not in self.pool_of]:
+            del self.pool_rows[h]
+        return out
+
+    def pool_split(self, rows):
+        """rows: [(pool, miner)] -> the pools with their blocks and, inside each pool, the miners it names"""
+        count, miners = {}, {}
+        for pool, miner in rows:
+            count[pool] = count.get(pool, 0) + 1
+            if miner:
+                m = miners.setdefault(pool, {})
+                m[miner] = m.get(miner, 0) + 1
+        out = []
+        for n, c in sorted(count.items(), key=lambda x: -x[1]):
+            e = {"name": n, "slug": re.sub(r"[^a-z0-9]+", "-", n.lower()).strip("-"), "blockCount": c}
+            if n in miners:
+                e["miners"] = [{"name": k, "blockCount": v} for k, v in sorted(miners[n].items(), key=lambda x: -x[1])]
+            out.append(e)
+        return out
+
+    def update_shares(self):
+        """per day: how many blocks pools mined. The oldest day read is partial, so it is left out; a day is only ever replaced by a fuller count."""
+        with self.lock:
+            rows = [(h, p) for h, p in self.pool_of.items() if h in self.headers]
+        if not rows:
+            return
+        days = {}
+        for h, p in rows:
+            d = self.headers[h][0] // DAY
+            c = days.setdefault(d, [0, 0])
+            c[1] += 1
+            if p != "Unknown":
+                c[0] += 1
+        oldest = min(days)
+        changed = False
+        for d, (pool, total) in days.items():
+            if d == oldest and self.pruned_at is not None or d == oldest and len(rows) >= POOL_BLOCKS:
+                continue                  # cut off by the pruned blocks or by POOL_BLOCKS: part of the day is missing
+            old = self.share_day.get(d)
+            if not old or total >= old[1]:
+                if old != [pool, total]:
+                    self.share_day[d] = [pool, total]
+                    changed = True
+        if changed:
+            save_shares(self.share_day)
+
+    def pool_hashrate(self, period):
+        """the hashrate of the mining pools together: the network's hashrate that day times the share of that day's blocks that pools mined.
+        period "epoch": the blocks since the last difficulty adjustment (the current 2016-block period) give the share"""
+        if period == "epoch":
+            with self.lock:
+                if not self.ready or not self.pool_of:
+                    raise RuntimeError("no data yet")
+                rate = self.now[0]
+                top = max(self.pool_of)
+                start = top - top % EPOCH
+                ep = [p for h, p in self.pool_of.items() if h >= start]
+            if not ep:
+                raise RuntimeError("no data yet")
+            share = sum(1 for p in ep if p != "Unknown") / len(ep)
+            return {"currentHashrate": rate * share, "currentShare": share, "networkHashrate": rate, "since": self.header(start)[0], "complete": True,
+                    "epochStart": start, "nextAdjustment": start + EPOCH, "blockCount": len(ep), "hashrates": []}
+        with self.lock:
+            if not self.ready:
+                raise RuntimeError("no data yet")
+            (fine, coarse, (rate, _)) = self.fine[0], self.coarse[0], self.now
+            days = dict(self.share_day)
+        span = {"24h": DAY, "14d": 14 * DAY, "1m": 30 * DAY, "6m": 183 * DAY, "1y": YEAR}[period]
+        series = fine if span <= 30 * DAY and fine else coarse
+        if not days or not series:
+            raise RuntimeError("no data yet")
+        end = series[-1][0]
+
+        def network_at(t):
+            lo, hi = 0, len(series) - 1
+            if t <= series[0][0]:
+                return series[0][1]
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                lo, hi = (mid, hi) if series[mid][0] <= t else (lo, mid)
+            (ta, va), (tb, vb) = series[lo], series[hi]
+            return va + (vb - va) * (t - ta) / (tb - ta) if tb > ta else va
+        points = []
+        for d in sorted(days):
+            t = d * DAY + DAY // 2
+            pool, total = days[d]
+            if total < 20 or t > end or t < end - span:
+                continue
+            share = pool / total
+            points.append({"timestamp": t, "avgHashrate": network_at(t) * share, "share": share, "networkHashrate": network_at(t)})
+        if not points:
+            raise RuntimeError("no data yet")
+        recent = [days[d] for d in sorted(days)[-7:]]
+        share_now = sum(x[0] for x in recent) / max(1, sum(x[1] for x in recent))
+        since = min(days) * DAY
+        return {"currentHashrate": rate * share_now, "currentShare": share_now, "networkHashrate": rate, "since": since,
+                "complete": since <= end - span + DAY, "hashrates": points}
+
+    def solo(self, period):
+        """the hashrate of miners without a pool, as far as blocks show it: the blocks of solo services plus the blocks that carry no
+        pool tag and no known payout address (an upper bound: a small pool missing from the list lands there too), times the network's hashrate"""
+        p = self.pools(period)
+        with self.lock:
+            rate = self.now[0]
+        total = max(1, p["blockCount"])
+        sources = []
+        for e in p["pools"]:
+            if SOLO_RX.search(e["name"]):
+                kind, name = "service", e["name"]
+            elif e["name"] == "Unknown":
+                kind, name = "unattributed", "No pool tag or known payout address"
+            else:
+                continue
+            sources.append({"name": name, "kind": kind, "blockCount": e["blockCount"], "share": e["blockCount"] / total, "hashrate": rate * e["blockCount"] / total})
+        blocks = sum(x["blockCount"] for x in sources)
+        out = {"window": p["window"], "blockCount": p["blockCount"], "soloBlocks": blocks, "share": blocks / total, "currentHashrate": rate * blocks / total,
+               "networkHashrate": rate, "sources": sources}
+        for k in ("epochStart", "nextAdjustment", "epochBlocks"):
+            if k in p:
+                out[k] = p[k]
+        return out
+
+    def pools(self, period):
+        with self.lock:
+            heights = [(h, p, self.miner_of.get(h, "")) for h, p in self.pool_of.items()]
+        if not heights:
+            raise RuntimeError("no data yet")
+        times = {h: self.headers[h][0] for h, _, _ in heights if h in self.headers}
+        if period == "epoch":              # since the last difficulty adjustment: every block read of the current 2016-block period
+            top = max(h for h, _, _ in heights)
+            start = top - top % EPOCH
+            rows = [(p, m) for h, p, m in heights if h >= start]
+            return {"window": "epoch", "blockCount": len(rows), "pools": self.pool_split(rows), "epochStart": start, "nextAdjustment": start + EPOCH, "epochBlocks": top - start + 1}
+        if period == "14d":                # the last difficulty period: the last 2016 blocks, as far as they have been read
+            top = max(h for h, _, _ in heights)
+            if min(h for h, _, _ in heights) <= top - EPOCH + 1:
+                rows = [(p, m) for h, p, m in heights if h > top - EPOCH]
+                return {"window": "14d", "blockCount": len(rows), "pools": self.pool_split(rows)}
+        newest = max(times.values()), min(times.values())
+        # the nearest period (not longer than asked for) that the blocks read so far reach back to
+        want = POOL_WINDOWS.get(period, POOL_WINDOWS["1m"])
+        fits = [(sec, name) for name, sec in POOL_WINDOWS.items() if sec <= want and newest[1] <= newest[0] - sec + 3600]
+        sec, name = max(fits) if fits else (min(POOL_WINDOWS.values()), "24h")
+        rows = [(p, m) for h, p, m in heights if h in times and times[h] >= newest[0] - sec]
+        return {"window": name, "blockCount": len(rows), "pools": self.pool_split(rows)}
+
+
+NODE = BtcRpc(os.environ["RPC_HOST"], os.environ.get("RPC_PORT", "8332"), os.environ["RPC_USER"], os.environ["RPC_PASS"])
+STATS = ChainStats(CHAIN, NODE)
+
+
+# ---------- the block being hashed: header of the node's block template ----------
+# A miner builds its block from the node's getblocktemplate. The merkle root follows from that template: the coinbase
+# (the miner's own, here a placeholder with the real height, reward and witness commitment) and the txids of the
+# transactions chosen by fee rate. The nonce is not part of any public data: it is only known once a block is found,
+# so the template reports it as null and the block it finds shows the real one (getblockheader "nonce").
+
+def _dsha(b):
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+
+def _blake(b):
+    return hashlib.blake2b(b, digest_size=32).digest()
+
+
+def _varint(n):
+    return bytes([n]) if n < 0xfd else b"\xfd" + struct.pack("<H", n) if n <= 0xffff else b"\xfe" + struct.pack("<I", n)
+
+
+def _height_push(h):
+    """BIP34: the block height as the first push of the coinbase script"""
+    b = h.to_bytes((h.bit_length() + 8) // 8, "little")
+    return bytes([len(b)]) + b
+
+
+def merkle_root(leaves, fn):
+    level = list(leaves)
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        level = [fn(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+    return level[0]
+
+
+def merkle_branch(leaves, fn):
+    """the hashes a miner combines with its own coinbase txid to get the merkle root (stratum's merkle branch)"""
+    branch, level = [], list(leaves)
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        branch.append(level[1])
+        level = [fn(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+    return branch
+
+
+MERKLE = {"fn": None, "name": "unverified"}
+
+
+def merkle_hash():
+    """Which hash builds the merkle tree of this chain: checked once against the merkle root of the node's own tip block."""
+    if MERKLE["fn"]:
+        return MERKLE["fn"], MERKLE["name"]
+    try:
+        tip = NODE.call("getblock", NODE.call("getblockhash", int(NODE.call("getblockcount"))), 1)
+        leaves = [bytes.fromhex(t)[::-1] for t in tip["tx"]]
+        for name, fn in (("sha256d", _dsha), ("blake2b", _blake)):
+            if merkle_root(leaves, fn)[::-1].hex() == tip.get("merkleroot"):
+                MERKLE["fn"], MERKLE["name"] = fn, name
+                return fn, name
+    except Exception as exc:
+        log("merkle check: " + str(exc))
+    return _dsha, "unverified"
+
+
+TEMPLATE = {"at": 0, "data": None}
+TEMPLATE_LOCK = threading.Lock()
+
+
+def block_template():
+    with TEMPLATE_LOCK:
+        if TEMPLATE["data"] and time.time() - TEMPLATE["at"] < 8:
+            return TEMPLATE["data"]
+        t = NODE.call("getblocktemplate", {"rules": ["segwit", "blake2b"] if CHAIN == "blake2b" else ["segwit"]})   # Knots on the BLAKE2b chain asks the client to name the blake2b rule
+        fn, how = merkle_hash()
+        tag = b"/hashes.space/"
+        script = _height_push(t["height"]) + bytes([len(tag)]) + tag
+        outs = [(t["coinbasevalue"], b"\x51")]
+        if t.get("default_witness_commitment"):
+            outs.append((0, bytes.fromhex(t["default_witness_commitment"])))
+        cb = struct.pack("<I", 2) + b"\x01" + b"\x00" * 32 + b"\xff\xff\xff\xff" + _varint(len(script)) + script + b"\xff\xff\xff\xff"
+        cb += _varint(len(outs)) + b"".join(struct.pack("<q", v) + _varint(len(s_)) + s_ for v, s_ in outs) + struct.pack("<I", 0)
+        leaves = [fn(cb)] + [bytes.fromhex(x["txid"])[::-1] for x in t.get("transactions", [])]
+        tip = NODE.call("getblockheader", t["previousblockhash"])
+        data = {"height": t["height"], "version": t["version"], "previousblockhash": t["previousblockhash"], "merkleroot": merkle_root(leaves, fn)[::-1].hex(),
+                "merklebranch": [h.hex() for h in merkle_branch(leaves, fn)], "merkleHash": how, "coinbase": "placeholder",
+                "time": t["curtime"], "bits": t["bits"], "target": t["target"], "nonce": None,
+                "nTx": len(leaves), "fees": sum(int(x.get("fee", 0)) for x in t.get("transactions", [])), "coinbasevalue": t["coinbasevalue"],
+                "weight": sum(int(x.get("weight", 0)) for x in t.get("transactions", [])), "tipNonce": tip.get("nonce")}
+        TEMPLATE["data"], TEMPLATE["at"], TEMPLATE["raw"] = data, time.time(), t
+        return data
+
+
+# ---------- the block assembly page: the block your node would build right now ----------
+# Everything on it is your node's own getblocktemplate: the coinbase value, the transactions it picked (best fee rate first),
+# the weight and sigop limits, and the 80-byte header with the merkle root of that selection. Nobody has mined this block yet.
+
+HDR = [("Version", 4, "#4a78c9"), ("Previous block", 32, "#7a6cd6"), ("Merkle root", 32, "#1bd8f4"), ("Time", 4, "#2fb585"), ("Bits", 4, "#d9a21b"), ("Nonce", 4, "#e8ebf5")]
+
+
+def _short(h, a=8, b=6):
+    return h if len(h) <= a + b + 1 else h[:a] + "…" + h[-b:]
+
+
+def assembly_parts():
+    d = block_template()
+    t = TEMPLATE.get("raw") or {}
+    txs = t.get("transactions", [])
+    rates = []
+    for x in txs:
+        vs = max(1, (int(x.get("weight", 0)) + 3) // 4)
+        rates.append((int(x.get("fee", 0)) / vs, x, vs))
+    only = sorted(r[0] for r in rates)
+    med = only[len(only) // 2] if only else 0.0
+    wlimit, slimit = int(t.get("weightlimit", 4_000_000)), int(t.get("sigoplimit", 80_000))
+    wused = int(d["weight"]) + 324          # the transactions plus the coinbase (about 324 weight units for the placeholder)
+    sused = sum(int(x.get("sigops", 0)) for x in txs)
+    sub = SUBSIDY0 >> (int(d["height"]) // 210000)
+    reward = int(d["coinbasevalue"])
+    fill = min(100.0, wused / wlimit * 100)
+    ver = d["version"] & 0xFFFFFFFF
+    hdr = (struct.pack("<I", d["version"] & 0xFFFFFFFF) + bytes.fromhex(d["previousblockhash"])[::-1] + bytes.fromhex(d["merkleroot"])[::-1]
+           + struct.pack("<I", d["time"]) + bytes.fromhex(d["bits"])[::-1] + b"\x00\x00\x00\x00").hex()
+    parts = [hdr[0:8], hdr[8:72], hdr[72:136], hdr[136:144], hdr[144:152], hdr[152:160]]
+    chips = ("<span class=chip>Block being mined <b>" + "{:,}".format(d["height"]) + "</b></span><span class=chip>not mined yet</span>"
+             "<span class=chip><b>" + "{:,}".format(len(txs)) + "</b> transactions picked</span>")
+    bar = "<div class=babytes>" + "".join("<i style='flex:" + str(sz) + ";background:" + c + "'></i>" for _, sz, c in HDR) + "</div>"
+    legend = "<div class=balegend>" + "".join("<span><i style='background:" + c + "'></i>" + k + " <em>" + str(sz) + " B</em></span>" for k, sz, c in HDR) + "</div>"
+    wpct, spct = "{:.1f}".format(wused / wlimit * 100), "{:.1f}".format(sused / slimit * 100)
+
+    def step(n, title, cap, body, cls):
+        return ("<div class='bast " + cls + "'><span class=ban>" + n + "</span><div class=batt><b>" + title + "</b><em>" + cap + "</em></div><div class=bastb>" + body + "</div></div>")
+    steps = (step("1", "Start with the coinbase", "pays whoever finds the block: the subsidy plus every fee, and the witness commitment",
+                  "<div class=babig>" + "{:,.4f}".format(reward / 1e8) + " <small>" + html.escape(COIN) + "</small></div><div class=basub>" + "{:,.4f}".format(sub / 1e8) + " subsidy + " + "{:,.4f}".format(int(d["fees"]) / 1e8) + " fees</div>", "s1")
+             + step("2", "Check the limits", "a pick that would break the weight or sigop limit is skipped and the next one is tried",
+                    "<div class=basub>Weight " + "{:,}".format(wused) + " of " + "{:,}".format(wlimit) + " (" + wpct + "%)</div><div class=bafill><i style='width:" + wpct + "%'></i></div>"
+                    "<div class=basub>Sigops " + "{:,}".format(sused) + " of " + "{:,}".format(slimit) + " (" + spct + "%)</div><div class=bafill><i style='width:" + spct + "%'></i></div>", "s3")
+             + step("3", "Finalize the template", "the merkle root of the coinbase and the picks goes into the 80-byte header miners hash",
+                    "<div class='babig mono'>" + _short(d["merkleroot"], 12, 8) + "</div><div class=basub>merkle root (" + html.escape(d["merkleHash"]) + ") of " + "{:,}".format(len(txs) + 1) + " transactions</div>" + bar + legend, "s4"))
+    why = ["0x{:08x}".format(ver) + " (" + "{:,}".format(d["version"]) + "): the version bits that signal soft forks",
+           "hash of block " + "{:,}".format(d["height"] - 1) + ", the block this one builds on",
+           "one hash of the coinbase and all " + "{:,}".format(len(txs)) + " picked transactions",
+           time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(d["time"])) + ": the miner may move it on while hashing",
+           "the target a hash must fall under: " + html.escape(str(d["bits"])),
+           "0 here: the search through the nonce is what miners do all day"]
+    off = [0, 4, 36, 68, 72, 76]
+    trs = "".join("<tr><td class=sw><i style='background:" + c + "'></i></td><td>" + k + "</td><td class=r>" + str(sz) + "</td><td class=r>" + str(o) + "</td><td class=why>" + w + "</td><td class='mono wrap'>" + hx + "</td></tr>"
+                  for (k, sz, c), o, w, hx in zip(HDR, off, why, parts))
+    details = ("<details><summary>The header, field by field</summary><div class=batbl><table><tr><th></th><th>Field</th><th class=r>Bytes</th><th class=r>From byte</th><th>What it is</th><th>Value (hex)</th></tr>" + trs + "</table></div></details>")
+    return {"chips": chips, "steps": steps, "details": details, "height": d["height"], "ntx": len(txs), "weight": wused, "limit": wlimit, "fill": round(fill, 1), "sub": sub / 1e8, "reward": reward / 1e8,
+            "fees": int(d["fees"]) / 1e8, "tk": COIN, "ver": "0x{:08x}".format(ver), "prev": d["previousblockhash"], "root": d["merkleroot"], "time": d["time"], "bits": d["bits"], "segs": [[sz, c] for _, sz, c in HDR]}
+
+
+ASM_CSS = """
+.bastage{display:grid;grid-template-columns:minmax(0,340px) minmax(0,1fr);gap:26px;align-items:center;overflow:hidden;background:radial-gradient(520px 320px at 16% 52%,rgba(var(--accent-rgb,247,147,26),.13),transparent 65%),linear-gradient(135deg,rgba(255,255,255,.055),rgba(255,255,255,.012));border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.06)}
+@media(max-width:860px){.bastage{grid-template-columns:1fr}}
+.bawrap{--S:216px;--D:78px;padding:calc(var(--D) + 6px) 0 4px 4px;display:flex;flex-direction:column;align-items:center;gap:10px}
+.bacube{position:relative;flex:none;width:var(--S);height:var(--S);margin:0 var(--D) 0 0}
+.bafront{position:absolute;inset:0;background:#5f5750;overflow:hidden;border-radius:2px;display:flex;flex-direction:column;align-items:center;padding:12px 10px 12px;text-align:center;font:13px/1.35 ui-monospace,Menlo,monospace;color:#fff}
+.batopf{position:absolute;left:0;top:calc(var(--D) * -1);width:var(--S);height:var(--D);background:#3d3730;transform-origin:0 100%;transform:skewX(-45deg)}
+.baside{position:absolute;left:var(--S);top:0;width:var(--D);height:var(--S);background:#2c2823;transform-origin:0 0;transform:skewY(-45deg)}
+.bacoin{position:absolute;left:8px;top:8px;width:26px;height:26px;border-radius:50%;background:#f7931a;color:#fff;font:700 16px/26px system-ui;text-align:center;font-style:normal}
+.baph{margin-top:34px;font-weight:700;font-size:15px}.badt{color:#e6dccd;min-height:19px}
+.barow{display:flex;gap:8px;justify-content:center;margin-top:1px}.barow i{font-style:normal;color:#dcd2c4}.barow b{color:#fff}
+.bastack{position:absolute;left:14px;right:14px;bottom:12px;display:flex;flex-direction:column-reverse;gap:4px}.bab{display:block;height:8px;width:100%;border-radius:4px;opacity:0;background:#7b9a2a}.bab:nth-child(2){width:94%}.bab:nth-child(3){width:98%}.bab:nth-child(4){width:90%}.bab:nth-child(5){width:96%}.bab:nth-child(1),.bab:nth-child(2),.bab:nth-child(3),.bab:nth-child(4),.bab:nth-child(5),.bab:nth-child(6){align-self:center}.bab.cb{background:#e0b43c}.bab.rj{background:#a8604f}
+.bacap{margin:0;color:var(--muted);font-size:12px;text-align:center;max-width:340px}
+.baright h2{font:600 11.5px/1.2 system-ui;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}.baright>p{font-size:15px;color:#c5cbe3;margin:0 0 14px;max-width:60ch}
+.basts{display:grid;gap:0}
+.bast{position:relative;display:grid;grid-template-columns:44px minmax(0,1fr);column-gap:10px;row-gap:1px;align-items:start;border-radius:12px;padding:12px 12px 14px 4px;transition:background .3s}
+.bast:not(:last-child)::after{content:'';position:absolute;left:21px;top:50px;bottom:-6px;width:1px;background:linear-gradient(rgba(255,255,255,.28),rgba(255,255,255,.05))}
+.bast .ban{grid-column:1;grid-row:1/4;width:34px;height:34px;margin:2px 0 0 4px;border-radius:50%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.28);color:#fff;font:600 13px/32px system-ui;text-align:center;transition:all .3s}
+.batt{display:contents}.batt b{grid-column:2;grid-row:1;font:600 11.5px/1.3 system-ui;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);transition:color .3s}.batt em{grid-column:2;grid-row:3;font-style:normal;color:#8e95b3;font-size:12.5px;margin-top:3px}
+.bastb{grid-column:2;grid-row:2;min-width:0}
+.bast.on{background:linear-gradient(90deg,rgba(27,216,244,.10),rgba(27,216,244,0) 70%)}.bast.on .ban{background:rgba(27,216,244,.16);border-color:var(--link);color:var(--link);box-shadow:0 0 0 4px rgba(27,216,244,.10),0 0 18px rgba(27,216,244,.35)}.bast.on .batt b{color:var(--link)}
+.bast.flash{animation:baflash 1.6s ease-out}@keyframes baflash{0%{background:rgba(27,216,244,.25)}100%{background:transparent}}@media(prefers-reduced-motion:reduce){.bast.flash{animation:none}}
+.babig{font:600 26px/1.2 system-ui;letter-spacing:-.01em}.babig small{font:500 13px system-ui;color:var(--muted)}.babig.mono{font-size:17px;color:var(--link)}@media(max-width:860px){.babig{font-size:22px}}
+.basub{color:#aab1cc;font-size:12.5px;margin-top:2px}
+.bafill{height:6px;border-radius:99px;background:rgba(255,255,255,.07);overflow:hidden;margin:5px 0 8px}.bafill i{display:block;height:100%;background:linear-gradient(90deg,#2fb585,var(--link));border-radius:99px}
+.batop5{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:3px;font-size:12.5px}.batop5 li{display:flex;flex-wrap:wrap;gap:2px 14px;align-items:baseline}.batop5 span{color:var(--muted)}
+.babytes{display:flex;height:20px;border-radius:7px;overflow:hidden;gap:2px;background:#0b0d17;border:1px solid var(--line);padding:3px;margin-top:8px}.babytes i{display:block;border-radius:3px;min-width:3px}
+.balegend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;font-size:12px;color:var(--muted)}.balegend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px}.balegend em{font-style:normal;color:var(--text)}
+.batbl{overflow-x:auto}.batbl td.sw{width:14px;padding-right:0}.batbl td.sw i{display:block;width:10px;height:10px;border-radius:3px}.batbl td.why{white-space:normal;color:var(--muted);font-size:13px;min-width:220px}.batbl td.wrap{max-width:360px}
+"""
+
+ASM_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now(),last={ntx:D.ntx,root:D.root};
+function $(i){return document.getElementById(i)}
+function ease(u){u=Math.max(0,Math.min(1,u));return 1-Math.pow(1-u,3)}
+function f4(n){return n.toLocaleString('en',{minimumFractionDigits:4,maximumFractionDigits:4})}
+var P=11000,EV=[{t:300,pick:0,check:0,land:0},{t:1800,pick:350,check:700,land:1000},{t:2900,pick:350,check:700,land:1000},{t:4800,pick:350,check:700,land:1000},{t:5900,pick:350,check:700,land:1000}],REJ={t:4000,pick:300,check:700};
+function stepOn(n){[].forEach.call(document.querySelectorAll('.bast'),function(e){e.classList.toggle('on',e.classList.contains('s'+n))})}
+function frame(now){var t=still?9000:(now-t0)%P,out=t>P-700?1-(t-(P-700))/700:1,bricks=document.querySelectorAll('.bab:not(.rj)'),rej=document.querySelector('.bab.rj'),ph='1 Coinbase',dt='',bad=false,acc=0,step=1;
+bricks.forEach(function(e,i){var ev=EV[i],u=t-ev.t,o=0,x=90;
+if(i===0){var k=ease(u/600);o=k;x=(1-k)*90;if(u>=0&&u<1500)dt=u<700?'subsidy '+f4(D.sub):'reward '+f4(D.reward)+' '+D.tk}
+else if(u>=0){if(u<ev.check){o=.35;x=12;ph='2 Check limits';dt='next pick';step=3}
+else if(u<ev.land){o=.75;x=5;ph='2 Check limits';dt='weight ✓ sigops ✓';step=3}
+else{var k2=ease((u-ev.land)/450);o=.75+.25*k2;x=5*(1-k2);if(u<ev.land+450){ph='2 Check limits';dt='fits · added ✓';step=3}acc+=k2}}
+e.style.opacity=o*out;e.style.transform='translateX('+x.toFixed(1)+'px)'});
+var ru=t-REJ.t,ro=0,rx=12;
+if(ru>=0&&ru<REJ.check+500){if(ru<REJ.pick){ro=.35;ph='2 Check limits';dt='next pick';step=3}else if(ru<REJ.check){ro=.8;rx=5;ph='2 Check limits';dt='weight ✗ too big';bad=true;step=3}else{var k3=(ru-REJ.check)/500;ro=.8*(1-k3);rx=5+k3*12;ph='2 Check limits';dt='skipped, next one';bad=true;step=3}}
+rej.style.opacity=ro*out;rej.style.transform='translateX('+rx.toFixed(1)+'px)';
+if(t>=6900){ph='3 Finalize';dt=t<7700?'selection is final':t<8800?'merkle root built':'template ready ✓';step=4}
+var fin=t>=6900?Math.min(1,(t-6900)/600):0;bricks.forEach(function(e){e.style.boxShadow=fin?'0 0 0 1px rgba(27,216,244,'+(.9*fin*out).toFixed(2)+')':''});
+var prog=Math.min(1,acc/4),a=$('baph'),b=$('badt');a.textContent=ph;b.textContent=dt;a.style.color=bad?'#ff8a80':t>=6900?'#7be8ff':'';b.style.color=bad?'#ff8a80':'';
+$('batx').textContent=Math.round(D.ntx*prog).toLocaleString('en');$('bafl').textContent=Math.round(D.fill*prog)+'%';$('bafee').textContent=f4(D.fees*prog);
+stepOn(step);if(!still)requestAnimationFrame(frame)}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/block-assembly.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';
+var dt=$('details'),open=[].map.call(dt.querySelectorAll('details'),function(x){return x.open});
+$('steps').innerHTML=d.steps;dt.innerHTML=d.details;[].forEach.call(dt.querySelectorAll('details'),function(x,i){x.open=!!open[i]});
+D=d;if(last.ntx!==d.ntx){var a=document.querySelector('.bast.s3');if(a)a.classList.add('flash')}
+if(last.root!==d.root){var b=document.querySelector('.bast.s4');if(b)b.classList.add('flash')}
+last={ntx:d.ntx,root:d.root};$('upd').innerHTML='live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+setInterval(tick,5000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+
+def assembly_page():
+    d = assembly_parts()
+    left = ("<div class=bawrap><div class=bacube><div class=bafront><i class=bacoin>&#8383;</i><div class=baph id=baph>1 Coinbase</div><div class=badt id=badt></div>"
+            "<div class=barow><i>Transactions</i><b id=batx>0</b></div><div class=barow><i>Fees</i><b id=bafee>0</b></div><div class=barow><i>Filled</i><b id=bafl>0%</b></div>"
+            "<div class=bastack aria-hidden=true><i class='bab cb'></i><i class=bab></i><i class=bab></i><i class=bab></i><i class=bab></i><i class='bab rj'></i></div></div>"
+            "<div class=batopf></div><div class=baside></div></div><p class=bacap>The block your node would build right now, put together as the page shows it. Nothing has been mined yet.</p></div>")
+    body = ("<style>" + ASM_CSS + "</style><div class=bhero><h1>Block assembly</h1><span id=chips style='display:contents'>" + d["chips"] + "<span class=chip id=upd><i></i> live</span></span></div>"
+            "<section class='card bastage'>" + left + "<div class=baright><h2>The block your node would build right now</h2><p>Nobody has mined it yet. Three steps, top to bottom, give the block miners will start hashing.</p>"
+            "<div class=basts id=steps>" + d["steps"] + "</div></div></section>"
+            "<section class=card id=details>" + d["details"] + "</section>"
+            "<script>" + ASM_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Block assembly", body)
+
+
+# ---------- the package sorting page: how your node fills the block it would build ----------
+# Bitcoin Core builds a block template from packages: a transaction is taken together with the unconfirmed parents it needs (child pays for parent),
+# a package is ranked by the fee rate of the whole, and the best packages fill the block first. All of it is read from your node's getblocktemplate
+# ("depends" tells which transactions of the template another one needs) and the size of its mempool.
+
+def _step(n, title, cap, body, cls):
+    return ("<div class='bast " + cls + "'><span class=ban>" + n + "</span><div class=batt><b>" + title + "</b><em>" + cap + "</em></div><div class=bastb>" + body + "</div></div>")
+
+
+def package_parts():
+    d = block_template()
+    t = TEMPLATE.get("raw") or {}
+    txs = t.get("transactions", [])
+    n = len(txs)
+    vs = [max(1, (int(x.get("weight", 0)) + 3) // 4) for x in txs]
+    fee = [int(x.get("fee", 0)) for x in txs]
+    deps = [[int(i) - 1 for i in x.get("depends", []) if 0 < int(i) <= n] for x in txs]
+    anc_cache = {}
+
+    def ancestors(i):
+        if i in anc_cache:
+            return anc_cache[i]
+        seen, stack = set(), list(deps[i])
+        while stack:
+            j = stack.pop()
+            if j not in seen:
+                seen.add(j)
+                stack.extend(deps[j])
+        anc_cache[i] = seen
+        return seen
+    pk = []                                   # per transaction of the template: (package fee rate, transactions in the package, own fee rate, fee rate of its parents)
+    for i in range(n):
+        a = ancestors(i) if deps[i] else set()
+        pf, pv = fee[i] + sum(fee[j] for j in a), vs[i] + sum(vs[j] for j in a)
+        af, av = sum(fee[j] for j in a), sum(vs[j] for j in a)
+        pk.append((pf / pv, 1 + len(a), fee[i] / vs[i], (af / av) if av else 0.0))
+    with_parents = [i for i in range(n) if deps[i]]
+    # the clearest child-pays-for-parent packages: the parents alone pay much less than the whole package
+    boosted = sorted((i for i in with_parents if pk[i][3] and pk[i][0] > pk[i][3] * 1.25), key=lambda i: -pk[i][0])
+    ex, seen_pairs = [], set()
+    for i in boosted:
+        key = (round(pk[i][3], 1), round(pk[i][2], 1))
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            ex.append(i)
+        if len(ex) == 3:
+            break
+    try:
+        waiting = int(NODE.call("getmempoolinfo").get("size", 0))
+    except Exception:  # noqa: BLE001
+        waiting = n
+    wused = int(d["weight"]) + 324
+    wlimit = int(t.get("weightlimit", 4_000_000))
+    wpct = "{:.1f}".format(wused / wlimit * 100)
+    cut = min((pk[i][0] for i in range(n)), default=0.0)
+    best = max((pk[i][0] for i in range(n)), default=0.0)
+    chips = ("<span class=chip>Block being mined <b>" + "{:,}".format(d["height"]) + "</b></span><span class=chip><b>" + "{:,}".format(waiting) + "</b> waiting in your mempool</span>"
+             "<span class=chip><b>" + "{:,}".format(n) + "</b> fit the next block</span>")
+    rank = sorted(range(n), key=lambda i: (-pk[i][0], i))[:6]
+    steps = (_step("1", "Look at the mempool", "your node keeps every transaction that is waiting for a block",
+                   "<div class=babig>" + "{:,}".format(waiting) + " <small>transactions waiting</small></div><div class=basub>the next block has room for about " + "{:,}".format(n) + " of them</div>", "s1")
+             + _step("2", "Group them into packages", "a transaction is taken together with the unconfirmed parents it needs, so a cheap parent can ride along with a child that pays well",
+                     "<div class=babig>" + "{:,}".format(len(with_parents)) + " <small>of the " + "{:,}".format(n) + " have unconfirmed parents</small></div>"
+                     , "s2")
+             + _step("3", "Fill the block", "the best packages go in first until the block is full; the rest wait for the next one",
+                     "<div class=basub>Weight " + "{:,}".format(wused) + " of " + "{:,}".format(wlimit) + " (" + wpct + "%)</div><div class=bafill><i style='width:" + wpct + "%'></i></div>"
+                     "<div class=basub>The last package that fitted paid <b>" + "{:,.1f}".format(cut) + " sat/vB</b>: that is about what a transaction needs to pay to make the next block.</div>"
+                     + ("<div class=basub>" + "{:,}".format(max(0, waiting - n)) + " transactions pay less and wait.</div>" if waiting > n else ""), "s4"))
+    # what the animated block shows: the real child-pays-for-parent packages (parent, child, whole), then the best single transaction
+    items = [{"lo": round(pk[i][3], 1), "hi": round(pk[i][2], 1), "rate": round(pk[i][0], 1)} for i in ex]
+    if len(items) < 3:
+        singles = [i for i in range(n) if not deps[i]]
+        for i in sorted(singles, key=lambda i: -pk[i][0])[: 3 - len(items)]:
+            items.append({"lo": None, "hi": round(pk[i][2], 1), "rate": round(pk[i][0], 1)})
+    return {"chips": chips, "steps": steps, "items": items, "ntx": n, "waiting": waiting, "fill": round(wused / wlimit * 100, 1), "cut": round(cut, 1), "height": d["height"]}
+
+
+PK_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now(),last={ntx:D.ntx};
+function $(i){return document.getElementById(i)}
+function ease(u){u=Math.max(0,Math.min(1,u));return u<.5?2*u*u:1-Math.pow(-2*u+2,2)/2}
+function rate(v){return v>=100?Math.round(v):v.toFixed(1)}
+var P=11000,ROW=22,NS='http://www.w3.org/2000/svg',g=$('pkg');
+function build(){g.innerHTML='';D.items.forEach(function(it,i){var e=document.createElementNS(NS,'g');e.setAttribute('class','pkx');
+var h='';if(it.lo!==null)h+='<line class="lnk" x1="22" y1="8" x2="50" y2="8"/><rect class="tx lo" x="0" y="0" width="22" height="16" rx="2"/><text x="11" y="8.5">'+rate(it.lo)+'</text><rect class="tx hi" x="28" y="0" width="22" height="16" rx="2"/><text x="39" y="8.5">'+rate(it.hi)+'</text><rect class="br" x="-2" y="-2" width="54" height="20" rx="3"/>';
+else h+='<rect class="tx mid" x="0" y="0" width="50" height="16" rx="2"/><text x="25" y="8.5">'+rate(it.hi)+'</text>';
+h+='<text class="rt" x="54" y="8.5">'+rate(it.rate)+' sat/vB</text>';e.innerHTML=h;e.dataset.r=it.rate;g.appendChild(e)})}
+function stepOn(n){[].forEach.call(document.querySelectorAll('.bast'),function(e){e.classList.toggle('on',e.classList.contains('s'+n))})}
+function frame(now){var t=still?9000:(now-t0)%P,out=t>P-700?1-(t-(P-700))/700:1,els=g.children,n=els.length,order=[].map.call(els,function(e,i){return i}),sorted=order.slice().sort(function(a,b){return D.items[b].rate-D.items[a].rate}),cap='1 Packages',step=2,fillu=0;
+if(t>=5000)cap='2 Fill the block',step=4;if(t>=9000)cap='Block filled · '+Math.round(D.fill)+'%';
+for(var i=0;i<n;i++){var rank=sorted.indexOf(i),a=ease((t-2800-0)/1200),y0=i*ROW+4,y1=rank*ROW+4,y=y0+(y1-y0)*a,x=0,o=ease((t-200-i*350)/500);
+var go=5200+rank*1300,u=ease((t-go)/900);if(t>=go){x=u*132;y=y+((6+rank*20)-y)*u}
+var rt=els[i].querySelector('.rt');rt.style.opacity=t>=1500&&t<go?1:0;
+els[i].setAttribute('transform','translate('+x.toFixed(1)+','+y.toFixed(1)+')');els[i].style.opacity=(t<go+900?o:o)*out;if(t>go+900&&u>=1)fillu=Math.max(fillu,rank+1)}
+$('pkblk').setAttribute('class',t>=5000?'blk on':'blk');var fh=Math.round(86*Math.min(1,D.fill/100)*Math.min(1,fillu/n));$('pkfill').setAttribute('height',fh);$('pkfill').setAttribute('y',89-fh);$('pkcap').textContent=cap;$('pksub').textContent=t>=5000?(t>=9000?'cutoff '+rate(D.cut)+' sat/vB':'best fee rate first'):t>=2300?'best fee rate first':'package = parent + child';
+stepOn(step);if(!still)requestAnimationFrame(frame)}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/package-sorting.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';$('steps').innerHTML=d.steps;D=d;build();
+if(last.ntx!==d.ntx){var a=document.querySelector('.bast.s1');if(a)a.classList.add('flash')}last={ntx:d.ntx};
+$('upd').innerHTML='live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+build();setInterval(tick,6000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+PK_CSS = """
+.pkpanel{width:100%;max-width:340px;display:grid;justify-items:center;gap:8px;background:#1b1d2c;border:1px solid var(--line);border-radius:14px;padding:16px 14px 14px;box-shadow:0 12px 34px rgba(0,0,0,.35)}
+.pkpanel h3{margin:0;font:600 17px/1.2 system-ui;color:#fff}.pkpanel .pksub{color:var(--muted);font-size:13px}
+.pksvg{width:100%;height:auto;overflow:visible}.pksvg .blk{fill:rgba(255,255,255,.03);stroke:#5b617f;stroke-width:.8;stroke-dasharray:3 2}.pksvg .blk.on{stroke:var(--link);stroke-dasharray:none}
+.pksvg .tx{stroke:none}.pksvg .tx.lo{fill:#3a3f5a}.pksvg .tx.hi{fill:#2f7d58}.pksvg .tx.mid{fill:#3f5fa5}.pksvg text{font:600 8px ui-monospace,Menlo,monospace;fill:#dfe3f5;text-anchor:middle;dominant-baseline:middle}
+.pksvg .lnk{stroke:#6b7192;stroke-width:1}.pksvg .br{fill:none;stroke:#9aa3c4;stroke-width:.7;stroke-dasharray:2 1.5;opacity:.8}.pksvg .rt{fill:#7be8ff;text-anchor:start;font-size:7px}
+.pksvg .fillr{fill:rgba(95,140,20,.55)}
+"""
+
+
+def package_page():
+    d = package_parts()
+    left = ("<div class=pkpanel><h3 id=pkcap>1 Packages</h3><svg class=pksvg viewBox='0 0 190 92' aria-hidden=true focusable=false><rect id=pkblk class=blk x=125 y=2 width=62 height=88 rx=3 />"
+            "<rect id=pkfill class=fillr x=126 y=89 width=60 height=0 /><g id=pkg></g></svg><span class=pksub id=pksub>package = parent + child</span>"
+            "<p class=bacap>Your node's packages, ranked and put into the block as the page shows it. Nothing has been mined yet.</p></div>")
+    body = ("<style>" + ASM_CSS + PK_CSS + "</style><div class=bhero><h1>Package sorting</h1><span id=chips style='display:contents'>" + d["chips"] + "<span class=chip id=upd><i></i> live</span></span></div>"
+            "<section class='card bastage'>" + left + "<div class=baright><h2>How your node fills the next block</h2><p>It does not take transactions one by one. It takes the best packages first, so a cheap parent is carried by a child that pays well.</p>"
+            "<div class=basts id=steps>" + d["steps"] + "</div></div></section>"
+            "<script>" + PK_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Package sorting", body)
+
+
+def auction_snapshot(items, blocks):
+    """the mempool as the fee auction page shows it (items: (fee rate, vsize, fee, txid), best first; blocks: the projected blocks)"""
+    n = len(items)
+    bands, cum, k = [[0, 0, None] for _ in FA_BANDS], 0, 0
+    for r, v, _, _ in items:
+        while k < len(FA_BANDS) - 1 and r < FA_BANDS[k][0]:
+            k += 1
+        bands[k][0] += 1
+        bands[k][1] += v
+        if bands[k][2] is None:
+            bands[k][2] = cum // 1_000_000 + 1
+        cum += v
+    first = blocks[0] if blocks else {"nTx": 0, "blockVSize": 0, "medianFee": 0, "feeRange": [0, 0, 0, 0, 0, 0, 0]}
+    return {"at": int(time.time()), "n": n, "vsize": cum, "top": [(round(r, 1), v, round(b), t) for r, v, b, t in items[:8]],
+            "bars": [round(items[int(i * (n - 1) / 6)][0], 1) for i in range(7)] if n >= 2 else [],
+            "bands": [tuple(b) for b in bands],
+            "b1": {"nTx": first["nTx"], "vsize": first["blockVSize"], "med": first["medianFee"], "lo": first["feeRange"][0], "hi": first["feeRange"][-1]}}
+
+
+# ---------- the fee auction page: every waiting transaction bids a fee rate for the next block ----------
+# Read from your node's own mempool (getrawmempool, refreshed by the explorer every 20 seconds): the bids ranked by fee rate, where they land
+# (block 1, 2, 3...) and the lowest bid that still makes the next block, the price of the space in it.
+
+FA_BANDS = [(100, None, "100 sat/vB and up"), (50, 100, "50 to 100"), (20, 50, "20 to 50"), (10, 20, "10 to 20"), (5, 10, "5 to 10"), (2, 5, "2 to 5"), (1, 2, "1 to 2"), (0, 1, "below 1")]
+
+
+def auction_parts():
+    a = STATS.auction
+    if not a:
+        raise RuntimeError("no mempool data yet")
+    n, total_v = a["n"], a["vsize"]
+    t = STATS.live or {}
+    b1 = a["b1"]
+    top = a["top"]
+    hi, med, lo = (a["bars"][0], a["bars"][3], a["bars"][6]) if len(a["bars"]) == 7 else (0, 0, 0)
+    chips = ("<span class=chip><b>" + "{:,}".format(n) + "</b> transactions waiting</span><span class=chip><b>" + "{:,.2f}".format(total_v / 1e6) + "</b> MvB of them</span>"
+             "<span class=chip>next block needs <b>" + "{:,.1f}".format(b1["lo"]) + "</b> sat/vB</span>")
+    steps = (_step("1", "Everyone bids", "a block has room for about 1,000,000 virtual bytes, and every waiting transaction offers a fee to get a place in it",
+                   "<div class=babig>" + "{:,}".format(n) + " <small>transactions waiting</small></div><div class=basub>" + "{:,.2f}".format(total_v / 1e6) + " MvB of transactions for blocks of 1 MvB: about "
+                   + "{:,.1f}".format(total_v / 1e6) + " blocks' worth</div>", "s1")
+             + _step("2", "Read every bid", "the bid is the fee rate: the fee divided by the size, in satoshis per virtual byte",
+                     "<div class=babig>" + "{:,.0f}".format(hi) + " <small>sat/vB: the highest bid</small></div><div class=basub>median " + "{:,.1f}".format(med) + " · lowest " + "{:,.1f}".format(lo) + " sat/vB</div>", "s2")
+             + _step("3", "The highest bids win", "miners take the best-paying packages first, so the bids are lined up from the top",
+                     "<div class=babig>" + "{:,}".format(b1["nTx"]) + " <small>transactions in block 1</small></div><div class=basub>" + "{:,}".format(b1["vsize"]) + " vB · median " + "{:,.1f}".format(b1["med"]) + " sat/vB</div>", "s3")
+             + _step("4", "The price of the next block", "the lowest bid that still fits in block 1 is the price of its space; everything below waits for a later block",
+                     "<div class=babig>" + "{:,.1f}".format(b1["lo"]) + " <small>sat/vB to get in</small></div>", "s4"))
+    rows = "".join("<tr><td>" + lab + "</td><td class=r>" + "{:,}".format(c) + "</td><td class=r>" + "{:,.0f}".format(v) + "</td><td class=r>" + ("block " + str(bn) if bn else "-") + "</td></tr>"
+                   for (_, _, lab), (c, v, bn) in zip(FA_BANDS, a["bands"]) if c)
+    details = ("<h2>Who waits where</h2><div class=batbl><table><tr><th>Fee rate</th><th class=r>Transactions</th><th class=r>Size (vB)</th><th class=r>First lands in</th></tr>" + rows + "</table></div>")
+    return {"chips": chips, "steps": steps, "details": details, "n": n, "bars": a["bars"], "cut": b1["lo"], "med": b1["med"], "hi": b1["hi"], "ntx": b1["nTx"], "at": a["at"]}
+
+
+FA_JS = r"""(function(){var D=__DATA__,busy=false,still=matchMedia('(prefers-reduced-motion: reduce)').matches,t0=performance.now(),last={n:D.n};
+function $(i){return document.getElementById(i)}
+function ease(u){u=Math.max(0,Math.min(1,u));return 1-Math.pow(1-u,3)}
+function num(v){return v>=100?Math.round(v).toLocaleString('en'):v.toFixed(1).replace(/\.0$/,'')}
+var P=9000,ORD=[3,0,5,2,4,1,6],bars=$('fabars');
+function build(){bars.innerHTML='';var mx=Math.max.apply(null,D.bars)||1;D.bars.forEach(function(v,i){var e=document.createElement('div');e.className='fb';e.innerHTML='<i style="height:'+Math.max(10,Math.round(Math.sqrt(v/mx)*100))+'%"></i><u>'+num(v)+'</u>';bars.appendChild(e)});
+$('fahead').textContent='~'+num(D.med)+' sat/vB';$('farange').textContent=num(D.bars[0])+' → '+num(D.bars[6])+' sat/vB';$('facount').textContent=D.n.toLocaleString('en')+' unconfirmed transactions'}
+function stepOn(n){[].forEach.call(document.querySelectorAll('.bast'),function(e){e.classList.toggle('on',e.classList.contains('s'+n))})}
+function frame(now){var t=still?7000:(now-t0)%P,out=t>P-600?1-(t-(P-600))/600:1,els=bars.children,w=100/7,step=2,cap=D.n.toLocaleString('en')+' unconfirmed transactions';
+for(var i=0;i<els.length;i++){var from=ORD[i],k=ease((t-1500-i*250)/900),pos=from+(i-from)*k;els[i].style.transform='translateX('+(pos*100)+'%)';els[i].style.opacity=Math.min(1,t/400)*out;
+var win=D.bars[i]>=D.cut;els[i].classList.toggle('win',t>3800&&win);els[i].classList.toggle('wait',t>3800&&!win);els[i].lastChild.style.opacity=k}
+if(t>=1500)step=3;if(t>=3800){step=4;cap='clearing price '+num(D.cut)+' sat/vB'}
+$('facount').textContent=cap;$('facut').style.opacity=t>=3800?1:0;stepOn(step);if(!still)requestAnimationFrame(frame)}
+function tick(){if(busy||document.hidden)return;busy=true;fetch('/fee-auction.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+$('chips').innerHTML=d.chips+'<span class=chip id=upd></span>';$('steps').innerHTML=d.steps;$('details').innerHTML=d.details;D=d;build();
+if(last.n!==d.n){var a=document.querySelector('.bast.s1');if(a)a.classList.add('flash')}last={n:d.n};
+$('upd').innerHTML='live · '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}).catch(function(){var u=$('upd');if(u)u.textContent='reconnecting…'}).then(function(){busy=false})}
+build();setInterval(tick,8000);document.addEventListener('visibilitychange',tick);requestAnimationFrame(frame);
+})();"""
+
+FA_CSS = """
+.fapanel{width:100%;max-width:340px;display:grid;justify-items:center;gap:6px;background:#1b1d2c;border:1px solid var(--line);border-radius:14px;padding:18px 14px 14px;box-shadow:0 12px 34px rgba(0,0,0,.35)}
+.fapanel .fahead{font:700 22px/1.2 system-ui;color:#fff}.fapanel .farange{color:var(--muted);font-size:14px}.fapanel .facount{color:#e5e8f6;font-size:14px;text-align:center;min-height:21px}
+.fabarsw{position:relative;width:100%;height:150px;margin:8px 0 4px}.fabars{position:absolute;inset:0}
+.fb{position:absolute;left:0;top:0;bottom:0;width:calc(100%/7);display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;padding:0 5px;will-change:transform}
+.fb i{display:block;width:100%;border-radius:4px 4px 2px 2px;background:linear-gradient(180deg,#e8ebf5,#9aa3c4)}.fb u{text-decoration:none;font:600 10.5px ui-monospace,Menlo,monospace;color:var(--muted)}
+.fb.win i{background:linear-gradient(180deg,#9ad9e8,#1bd8f4)}.fb.wait i{background:linear-gradient(180deg,#59607d,#3a3f5a)}.fb.win u{color:#7be8ff}
+.facut{opacity:0;transition:opacity .4s;color:#7be8ff;font-size:12px}
+"""
+
+
+def auction_page():
+    d = auction_parts()
+    left = ("<div class=fapanel><span class=fahead id=fahead></span><span class=farange id=farange></span><div class=fabarsw><div class=fabars id=fabars aria-hidden=true></div></div>"
+            "<span class=facount id=facount></span><span class=facut id=facut>cyan bars make the next block</span>"
+            "<p class=bacap>The bids of your node's mempool, lined up from the highest, as the page shows it. Nothing has been mined yet.</p></div>")
+    body = ("<style>" + ASM_CSS + FA_CSS + "</style><div class=bhero><h1>Fee auction</h1><span id=chips style='display:contents'>" + d["chips"] + "<span class=chip id=upd><i></i> live</span></span></div>"
+            "<section class='card bastage'>" + left + "<div class=baright><h2>How the waiting transactions compete for the next block</h2><p>Block space is limited, so every transaction bids with its fee rate and the highest bids win the next block.</p>"
+            "<div class=basts id=steps>" + d["steps"] + "</div></div></section>"
+            "<section class=card id=details>" + d["details"] + "</section>"
+            "<script>" + FA_JS.replace("__DATA__", json.dumps(d, separators=(",", ":"))) + "</script>")
+    return page("Fee auction", body)
+
+
+def difficulty_adjustment():
+    """Where the chain is in its difficulty period (2016 blocks), as mempool's /api/v1/difficulty-adjustment."""
+    tip = int(NODE.call("getblockcount"))
+    start = tip - tip % EPOCH
+    t_tip, t_start = STATS.header(tip)[0], STATS.header(max(1, start))[0]
+    done = tip - start
+    avg = (t_tip - t_start) / done if done else 600.0
+    if avg <= 0:
+        avg = 600.0
+    change = max(-75.0, min(300.0, (600.0 / avg - 1) * 100)) if done else 0.0
+    left = EPOCH - done
+    prev = None
+    if start - EPOCH >= 1:
+        w1, w0 = STATS.header(max(1, start))[2], STATS.header(start - EPOCH)[2]
+        prev = (w1 / w0 - 1) * 100 if w0 else None
+    return {"progressPercent": round(done / EPOCH * 100, 2), "difficultyChange": round(change, 2), "estimatedRetargetDate": int((t_tip + left * avg) * 1000),
+            "remainingBlocks": left, "remainingTime": int(left * avg * 1000), "previousRetarget": None if prev is None else round(prev, 2),
+            "previousTime": t_start, "nextRetargetHeight": start + EPOCH, "timeAvg": int(avg * 1000), "expectedBlocks": round((t_tip - t_start) / 600.0, 1) if done else 0}
+
+
+
+# ---------- the next block: when it is expected ----------
+# Blocks are found by chance (every hash is an independent try), so no node can know the moment; the average wait is what can be worked out, and the
+# better the pace of the miners is known, the better that average is. It is estimated from several things together:
+#   1. the real pace of the miners: the hashes the last blocks took, over the time they took, the newest counting most (the weight halves every NEXT_HALF blocks)
+#      and the block timestamps taken end to end, so one block with a wrong clock does no harm
+#   2. the difficulty of the block that is being mined now (not the last one's): at a Bitcoin retarget it follows from the period's pace, on a chain that
+#      retargets every block it is the node's own number for the next block
+#   3. the chain's target, as a limit: an average outside a tenth to ten times the target is not believed
+# The block that comes next takes `w_next` hashes at that pace, so the average wait is w_next / pace. The error of the pace shrinks with the blocks that count.
+def next_block_estimate(blocks, w_next, half):
+    """blocks: [(time, hashes the block took)], oldest first. Returns (average wait in seconds, relative error, blocks that count) or None."""
+    num = den = wsum = w2 = 0.0
+    n = len(blocks)
+    for j in range(1, n):
+        wt = 0.5 ** ((n - 1 - j) / half)
+        num += wt * blocks[j][1]
+        den += wt * (blocks[j][0] - blocks[j - 1][0])
+        wsum += wt
+        w2 += wt * wt
+    if num <= 0 or den <= 0 or w_next <= 0:
+        return None
+    n_eff = wsum * wsum / w2 if w2 else 0.0
+    return w_next / (num / den), (1 / math.sqrt(n_eff) if n_eff > 0 else 1.0), n_eff
+
+
+def next_block_answer(chain, tip, last_time, mean, err, n_eff, window, target, change, retarget):
+    mean = max(target / 10.0, min(target * 10.0, mean))
+    return {"chain": chain, "tip": tip, "lastBlockTime": last_time, "targetSeconds": target, "meanSeconds": round(mean, 1),
+            "medianSeconds": round(mean * 0.6931, 1), "relativeError": round(err, 3), "blocksCounted": int(n_eff), "windowBlocks": window,
+            "nextDifficultyChange": round(change, 2), "retargetNext": retarget, "updated": int(time.time())}
+
+
+NEXT_WINDOW, NEXT_HALF, TARGET_SECONDS = 288, 60.0, 600       # two days of blocks looked at; the weight of a block halves every 60 blocks
+_next = {"at": 0.0, "data": None}
+_next_lock = threading.Lock()
+
+
+def next_block():
+    with _next_lock:
+        if _next["data"] and time.time() - _next["at"] < 15:
+            return _next["data"]
+    tip = int(NODE.call("getblockcount"))
+    heads = [STATS.header(h) for h in range(max(1, tip - NEXT_WINDOW + 1), tip + 1)]
+    blocks = [(h[0], float(h[2])) for h in heads]
+    w_tip, w_next = float(heads[-1][2]), float(heads[-1][2])
+    retarget = (tip + 1) % EPOCH == 0
+    if retarget:                       # the next block opens a new difficulty period: its difficulty follows from the pace of the one that ends
+        actual = max(1, heads[-1][0] - STATS.header(tip - EPOCH + 1)[0])
+        w_next = w_tip * max(0.25, min(4.0, EPOCH * TARGET_SECONDS / actual))
+    est = next_block_estimate(blocks, w_next, NEXT_HALF)
+    if not est:
+        raise RuntimeError("not enough blocks to tell")
+    out = next_block_answer(CHAIN, tip, heads[-1][0], est[0], est[1], est[2], len(blocks), TARGET_SECONDS, (w_next / w_tip - 1) * 100, retarget)
+    with _next_lock:
+        _next["at"], _next["data"] = time.time(), out
+    return out
+
+
+def recommended_fees():
+    """Fee rates (sat/vB) from your own mempool: the blocks it would build next, best fee rate first."""
+    with STATE_LOCK:
+        mb = STATE["mempool"]
+    if not mb:
+        raise RuntimeError("no mempool data yet")
+    low = float(NODE.call("getmempoolinfo").get("mempoolminfee", 0.00001)) * 1e5      # BTC/kvB -> sat/vB
+    med = [b["medianFee"] for b in mb]
+    at = lambda i: med[min(i, len(med) - 1)]
+    minimum = max(round(low, 2), 0.1)
+    return {"fastestFee": max(minimum, at(0)), "halfHourFee": max(minimum, at(1)), "hourFee": max(minimum, at(2)),
+            "economyFee": max(minimum, round(mb[-1]["feeRange"][1], 2)), "minimumFee": minimum}
+
+
+def halving():
+    tip = int(NODE.call("getblockcount"))
+    nxt = (tip // 210000 + 1) * 210000
+    left = nxt - tip
+    t_tip = STATS.header(tip)[0]
+    return {"height": tip, "nextHalvingHeight": nxt, "remainingBlocks": left, "estimatedDate": int((t_tip + left * 600) * 1000),
+            "subsidyNow": (SUBSIDY0 >> (tip // 210000)) / 1e8, "subsidyNext": (SUBSIDY0 >> (nxt // 210000)) / 1e8}
+
+
+def network():
+    ni, mi, ci = NODE.call("getnetworkinfo"), NODE.call("getmempoolinfo"), NODE.call("getblockchaininfo")
+    return {"node": ni.get("subversion"), "protocol": ni.get("protocolversion"), "connections": ni.get("connections"),
+            "connectionsIn": ni.get("connections_in"), "connectionsOut": ni.get("connections_out"),
+            "mempool": {"count": mi.get("size"), "vsize": mi.get("bytes"), "memory": mi.get("usage"), "totalFee": mi.get("total_fee"),
+                        "minFeeRate": float(mi.get("mempoolminfee", 0)) * 1e5, "fullRbf": mi.get("fullrbf")},
+            "chain": {"blocks": ci.get("blocks"), "headers": ci.get("headers"), "sizeOnDisk": ci.get("size_on_disk"), "pruned": ci.get("pruned"),
+                      "pruneHeight": ci.get("pruneheight"), "verificationProgress": ci.get("verificationprogress")}}
+
+
+def block_statistics(ident):
+    """Statistics of one block: fees and fee rates (the node's undo data), SegWit and Taproot share, OP_RETURN, total sent."""
+    h = NODE.call("getblockhash", int(ident)) if str(ident).isdigit() else ident
+    if not HEX64.fullmatch(h):
+        raise ValueError("not a block")
+    st = NODE.call("getblockstats", h, timeout=120)
+    out = {"hash": h, "height": st["height"], "timestamp": st["time"], "txs": st["txs"], "totalFees": st["totalfee"], "avgFee": st["avgfee"], "medianFee": st["medianfee"],
+           "minFee": st["minfee"], "maxFee": st["maxfee"], "avgFeeRate": st["avgfeerate"], "minFeeRate": st["minfeerate"], "maxFeeRate": st["maxfeerate"],
+           "feeRatePercentiles": st.get("feerate_percentiles"), "size": st["total_size"], "weight": st["total_weight"], "avgTxSize": st["avgtxsize"],
+           "segwitTxs": st["swtxs"], "segwitShare": round(st["swtxs"] / st["txs"], 4) if st["txs"] else 0, "inputs": st["ins"], "outputs": st["outs"],
+           "totalOut": st["total_out"], "subsidy": st["subsidy"], "utxoIncrease": st["utxo_increase"], "utxoSizeIncrease": st["utxo_size_inc"]}
+    b = NODE.call("getblock", h, 2, timeout=120)       # the outputs' types: Taproot and OP_RETURN
+    tap = opret = 0
+    for t in b["tx"][1:]:
+        types = [o.get("scriptPubKey", {}).get("type") for o in t["vout"]]
+        tap += "witness_v1_taproot" in types
+        opret += types.count("nulldata")
+    n = max(1, len(b["tx"]) - 1)
+    out.update({"taprootTxs": tap, "taprootShare": round(tap / n, 4), "opReturnOutputs": opret})
+    return out
+
+
+def chain_tips():
+    """Every chain the node knows: the active one and the forks (stale blocks) next to it."""
+    tips = NODE.call("getchaintips")
+    out = []
+    for t in sorted(tips, key=lambda x: -x["height"]):
+        try:
+            hd = NODE.call("getblockheader", t["hash"])
+            when = hd.get("time")
+        except Exception:  # noqa: BLE001
+            when = None
+        out.append({"height": t["height"], "hash": t["hash"], "branchLength": t["branchlen"], "status": t["status"], "timestamp": when,
+                    "stale": t["status"] != "active" and t["branchlen"] > 0})
+    return out
+
+
+def tx_projection(txid):
+    """Where a mempool transaction lands: the block of the projected blocks it fits in, its CPFP package, and whether it can be replaced."""
+    e = NODE.call("getmempoolentry", txid)
+    v = e.get("vsize") or e.get("size") or 1
+    f = e.get("fees", {})
+    base = float(f.get("base", e.get("fee", 0))) * 1e8
+    own = base / v
+    anc = float(f.get("ancestor", 0)) * 1e8 / max(1, e.get("ancestorsize", v))
+    desc = float(f.get("descendant", 0)) * 1e8 / max(1, e.get("descendantsize", v))
+    rate = max(own, anc, desc)                  # what a miner sees: the best of its own rate and its packages' rates
+    with STATE_LOCK:
+        mb = STATE["mempool"]
+    slot = None
+    for i, b in enumerate(mb):
+        if rate >= b["feeRange"][0]:
+            slot = i
+            break
+    mi = NODE.call("getmempoolinfo")
+    signals = None
+    try:
+        raw = NODE.call("getrawtransaction", txid, True)
+        signals = any(int(i.get("sequence", 0xffffffff)) < 0xfffffffe for i in raw["vin"])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"txid": txid, "vsize": v, "fee": round(base), "feeRate": round(own, 2), "effectiveFeeRate": round(rate, 2),
+            "ancestors": e.get("ancestorcount", 1) - 1, "descendants": e.get("descendantcount", 1) - 1,
+            "ancestorFeeRate": round(anc, 2), "descendantFeeRate": round(desc, 2),
+            "projectedBlock": slot, "etaMinutes": None if slot is None else (slot + 1) * 10,
+            "minFeeOfNextBlock": mb[0]["feeRange"][0] if mb else None, "minFeeOfLastProjected": mb[-1]["feeRange"][0] if mb else None,
+            "signalsRbf": signals, "nodeReplacesWithoutSignal": bool(mi.get("fullrbf")), "replaceable": bool(signals) or bool(mi.get("fullrbf")),
+            "bip125Replaceable": e.get("bip125-replaceable"), "age": int(time.time() - e.get("time", time.time()))}
+
+
+ADDR_RE = re.compile(r"[A-Za-z0-9]{14,90}")
+ADDR = {}                                   # address -> {"state": scanning|done|error, "result"|"error", "at"}
+ADDR_LOCK = threading.Lock()                # one scan at a time: it reads the whole UTXO set
+SCAN_RPC = None
+
+
+def address_scan(addr):
+    """Start (or read) the balance scan of one address. scantxoutset reads the whole UTXO set, so it runs in the background."""
+    if not ADDRESS_SCAN:
+        raise ValueError("address balances are switched off on this explorer")
+    if not ADDR_RE.fullmatch(addr) or not NODE.call("validateaddress", addr).get("isvalid"):
+        raise ValueError("not a valid address")
+    hit = ADDR.get(addr)
+    if hit and hit["state"] == "done" and time.time() - hit["at"] < 600:
+        return hit
+    if hit and hit["state"] == "scanning":
+        return hit
+    if not ADDR_LOCK.acquire(blocking=False):
+        return {"state": "busy", "at": time.time()}
+    ADDR[addr] = {"state": "scanning", "at": time.time()}
+
+    def run():
+        global SCAN_RPC
+        try:
+            if SCAN_RPC is None:        # its own connection: the scan must not hold up the explorer's other calls
+                SCAN_RPC = BtcRpc(NODE.host, NODE.port, os.environ["RPC_USER"], os.environ["RPC_PASS"])
+            r = SCAN_RPC.call("scantxoutset", "start", ["addr(" + addr + ")"], timeout=900)
+            ADDR[addr] = {"state": "done", "at": time.time(), "result": {"address": addr, "balance": round(float(r.get("total_amount", 0)) * 1e8),
+                          "unspents": [{"txid": u["txid"], "vout": u["vout"], "value": round(float(u["amount"]) * 1e8), "height": u.get("height")} for u in r.get("unspents", [])][:200],
+                          "unspentCount": len(r.get("unspents", [])), "scannedAtHeight": r.get("height")}}
+        except Exception as exc:  # noqa: BLE001
+            ADDR[addr] = {"state": "error", "at": time.time(), "error": str(exc)}
+        finally:
+            ADDR_LOCK.release()
+            for k in [k for k, v in ADDR.items() if time.time() - v["at"] > 3600]:
+                ADDR.pop(k, None)
+    threading.Thread(target=run, daemon=True).start()
+    return ADDR[addr]
+
+
+def spent_or_pruned_tx(txid):
+    """A pruned node cannot read a transaction that left its blocks, but the UTXO set still knows the unspent outputs of recent
+    and unspent transactions: find those (gettxout), and say what the node can tell about the rest."""
+    found = []
+    for n in range(0, 24):
+        try:
+            o = NODE.call("gettxout", txid, n, True)
+        except Exception:  # noqa: BLE001
+            break
+        if o:
+            found.append((n, o))
+        elif n >= 4 and not found:
+            break
+    return found
+
+
+def check_node():
+    """Refuse a node of the other chain: the Bitcoin Explorer reads the regular Bitcoin chain (the Bitcoin Node app, or Libre Relay,
+    a Bitcoin Core fork), the BLAKE2b Explorer the Bitcoin Knots app. Umbrel lets you choose the Bitcoin app per app, so a wrong choice would otherwise show
+    the wrong chain without a word. Set STRICT_NODE=0 to switch the check off."""
+    if os.environ.get("STRICT_NODE", "1") == "0":
+        return
+    sub = NODE.call("getnetworkinfo").get("subversion", "")
+    knots = "knots" in sub.lower()          # Libre Relay is a Bitcoin Core fork on the regular Bitcoin chain, so it counts as Bitcoin
+    if CHAIN == "blake2b" and not knots:
+        raise RuntimeError("this explorer is connected to " + sub + ", not to the Bitcoin Knots app: in Umbrel, choose Bitcoin Knots for it")
+    if CHAIN == "sha256" and knots:
+        raise RuntimeError("this explorer is connected to " + sub + ", not to the regular Bitcoin Node app: in Umbrel, choose Bitcoin Node for it")
+STATE = {"blocks": [], "mempool": [], "mempool_json": "", "error": "starting", "info": {}, "mempool_count": 0, "at": 0}
+STATE_LOCK = threading.Lock()
+
+
+def stats_worker():
+    """hashrate and pool statistics: recomputed every 10 minutes (the first run reads the pool of every block of the period)"""
+    while True:
+        try:
+            check_node()
+            STATS.refresh_hashrate()
+            STATS.refresh_pools()
+            STATS.update_shares()
+            STATS.refresh_history()
+            log("mining statistics ready (tip " + str(STATS.tip) + ")")
+        except Exception as exc:  # noqa: BLE001
+            STATS.error = str(exc)
+            log("mining statistics: " + str(exc))
+        time.sleep(600)
+
+
+# ---------- WebSocket (mempool protocol) ----------
+
+_clients = set()
+_clients_lock = threading.Lock()
+_send_lock = threading.Lock()
+
+
+def ws_send(sock, text):
+    data = text.encode()
+    head = bytearray([0x81])
+    if len(data) < 126:
+        head.append(len(data))
+    elif len(data) < 65536:
+        head += bytes([126]) + struct.pack(">H", len(data))
+    else:
+        head += bytes([127]) + struct.pack(">Q", len(data))
+    with _send_lock:
+        sock.sendall(bytes(head) + data)
+
+
+def broadcast(obj):
+    text = json.dumps(obj)
+    with _clients_lock:
+        dead = []
+        for c in _clients:
+            try:
+                ws_send(c, text)
+            except OSError:
+                dead.append(c)
+        for c in dead:
+            _clients.discard(c)
+
+
+def view(b):
+    return {k: v for k, v in b.items() if k != "previousblockhash"}
+
+
+def poller():
+    """every few seconds: is there a new block (pushed to the page at once), and every 20 seconds the mempool blocks"""
+    last_mempool = 0
+    while True:
+        try:
+            check_node()
+            info = NODE.call("getblockchaininfo")
+            if not POOLS.tags:
+                raise RuntimeError("the list of mining pools is still loading")
+            if info.get("initialblockdownload"):
+                raise RuntimeError("the node is still syncing (" + "{:.1f}".format(info.get("verificationprogress", 0) * 100) + "%)")
+            blocks = STATS.refresh_live_blocks()
+            try:
+                info["subversion"] = NODE.call("getnetworkinfo").get("subversion", "")     # which node answers: shows in /api/v1/status
+            except Exception:  # noqa: BLE001
+                pass
+            fresh = STATE["blocks"] and blocks[0]["id"] != STATE["blocks"][0]["id"] and blocks[0]["height"] > STATE["blocks"][0]["height"]
+            with STATE_LOCK:
+                STATE.update(blocks=blocks, info=info, error="", at=int(time.time()))
+            if fresh:
+                broadcast({"block": blocks[0]})
+                last_mempool = 0                       # a block changes the mempool: recompute now
+            if time.time() - last_mempool > 20:
+                try:
+                    mp, count = STATS.refresh_live_mempool()
+                    text = json.dumps(mp)
+                    with STATE_LOCK:
+                        STATE["mempool_count"] = count
+                    if text != STATE["mempool_json"]:
+                        with STATE_LOCK:
+                            STATE["mempool"], STATE["mempool_json"] = mp, text
+                        broadcast({"mempool-blocks": mp})
+                except Exception as exc:  # noqa: BLE001
+                    log("mempool: " + str(exc))
+                last_mempool = time.time()
+        except Exception as exc:  # noqa: BLE001
+            with STATE_LOCK:
+                STATE["error"] = str(exc)
+            log("poll: " + str(exc))
+        time.sleep(6)
+
+
+def need_live():
+    with STATE_LOCK:
+        if STATE["error"] or not STATE["blocks"]:
+            raise RuntimeError(STATE["error"] or "no data yet")
+        return STATE["blocks"], STATE["mempool"]
+
+
+# ---------- DATUM verified community: payout addresses are shown only to members who signed in with Discord ----------
+# The explorer never shows the addresses a pool pays out to (block page, transaction list, animation, transaction and address pages) until the visitor
+# has signed in with Discord and holds the DATUM Verified role on the community server. Setup: put a file discord.json in this app's data folder:
+#   {"client_id": "...", "client_secret": "...", "guild_id": "<server id>", "role_id": "<DATUM Verified role id>", "public_url": "https://btc.hashes.space"}
+# (or the environment variables DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_GUILD_ID, DISCORD_ROLE_ID, PUBLIC_URL). In the Discord developer portal add
+# <public_url>/auth/discord/callback as a redirect of the application. Without that file nobody is verified and the addresses stay hidden.
+STATE_DIR = os.environ.get("STATE_DIR", "/state")
+VERIFY_DAYS = 7
+REQ = threading.local()                       # per request: ok (verified), path, host, cookies to set
+
+
+def discord_cfg():
+    cfg = {}
+    try:
+        with open(os.path.join(STATE_DIR, "discord.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    for k, env in (("client_id", "DISCORD_CLIENT_ID"), ("client_secret", "DISCORD_CLIENT_SECRET"), ("guild_id", "DISCORD_GUILD_ID"), ("role_id", "DISCORD_ROLE_ID"), ("public_url", "PUBLIC_URL")):
+        if os.environ.get(env):
+            cfg[k] = os.environ[env]
+    return cfg if all(cfg.get(k) for k in ("client_id", "client_secret", "guild_id", "role_id")) else None
+
+
+_SECRET = []
+
+
+def session_secret():
+    if not _SECRET:
+        f = os.path.join(STATE_DIR, "session.key")
+        try:
+            with open(f, "rb") as fh:
+                _SECRET.append(fh.read())
+        except OSError:
+            key = os.urandom(32)
+            try:
+                with open(f, "wb") as fh:
+                    fh.write(key)
+            except OSError:
+                pass
+            _SECRET.append(key)
+    return _SECRET[0]
+
+
+def sign(text):
+    import hmac
+    return hmac.new(session_secret(), text.encode(), hashlib.sha256).hexdigest()
+
+
+def make_cookie(name, value, days):
+    exp = int(time.time()) + int(days * 86400)
+    return "{}={}.{}.{}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax".format(name, value, exp, sign(name + "|" + value + "|" + str(exp)), int(days * 86400))
+
+
+def read_cookie(header, name):
+    """the value of a signed cookie made by make_cookie, or None when absent, expired or forged"""
+    import hmac
+    for part in (header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == name:
+            try:
+                value, exp, sig = v.rsplit(".", 2)
+                if int(exp) > time.time() and hmac.compare_digest(sig, sign(name + "|" + value + "|" + exp)):
+                    return value
+            except ValueError:
+                return None
+    return None
+
+
+PROTECTED_POOL = "OCEAN"     # on the Bitcoin (SHA-256) explorer only blocks mined by this pool are for the verified community; on the BLAKE2b explorer no block is
+
+
+def protect(pool):
+    """mark the page being built as showing a pool's payout information: only the Bitcoin explorer protects a pool (OCEAN), the BLAKE2b explorer protects none"""
+    REQ.protected = CHAIN != "blake2b" and pool == PROTECTED_POOL
+
+
+def is_verified():
+    """may this visitor see payout addresses and the whole block: yes when signed in with the DATUM Verified role, and always for blocks that are not protected"""
+    return bool(getattr(REQ, "ok", False)) or not getattr(REQ, "protected", True)
+
+
+def address_allowed():
+    """address lookups: on the Bitcoin explorer only for visitors signed in with the DATUM Verified role (the check never falls back to "not protected");
+    the BLAKE2b explorer protects nothing, so its lookups stay open (they are rate limited)"""
+    return bool(getattr(REQ, "ok", False)) or CHAIN == "blake2b"
+
+
+def out_label(o, short=False):
+    """what a transaction output shows: its address (hidden for visitors who are not verified), or its script type"""
+    spk = o.get("scriptPubKey", {})
+    a = spk.get("address")
+    if not a:
+        return spk.get("type", "")
+    if not is_verified():
+        return "hidden"
+    return short_addr(a) if short else a
+
+
+def verify_box(full=True):
+    """the lock shown in place of payout addresses: what the community is for, and the Get verified button (full=False: just the button)"""
+    nxt = urllib.request.quote(getattr(REQ, "path", "/") or "/", safe="/")
+    btn = "<a class=verify href='/auth/discord?next=" + nxt + "'><span aria-hidden=true>&#128274;</span> Get verified</a>"
+    if not full:
+        return "<span class=locked>" + btn + "</span>"
+    return ("<div class=locked><p><b>Only DATUM Verified pool contributors have access to transaction information of the pool they are hashing on.</b></p>"
+            "<p class=muted>Join for free and confirm your payout address by proving you hash " + NAME + " blocks on a DATUM verified pool.</p>" + btn + "</div>")
+
+
+NEXT_RE = re.compile(r"/[A-Za-z0-9._~%/?=&+,:@-]{0,300}")
+
+
+def safe_next(v):
+    """where to go after the sign-in: only a plain path of this site (no scheme, no //, no backslash, no control characters), else the home page"""
+    v = v if isinstance(v, str) else ""
+    return v if NEXT_RE.fullmatch(v) and not v.startswith("//") and "%0" not in v.lower() and "%5c" not in v.lower() else "/"
+
+
+def discord_call(url, data=None, token=None):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode() if data else None,
+                                 headers={"User-Agent": "hashes-space-explorer (+https://hashes.space)", **({"Authorization": "Bearer " + token} if token else {}),
+                                          **({"Content-Type": "application/x-www-form-urlencoded"} if data else {})})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
+
+
+def auth_start(next_path):
+    cfg = discord_cfg()
+    if not cfg:
+        return None, page("Get verified", "<h1>Get verified</h1><section class=card><p>Payout addresses are shown to members of the DATUM verified community. Sign-in with Discord is not set up on this explorer yet, "
+                          "so they stay hidden for now.</p><p><a href='/'>Back to the explorer</a></p></section>")
+    state = os.urandom(12).hex()
+    REQ.cookies.append(make_cookie("dvs", state + "~" + urllib.request.quote(next_path, safe="/"), 0.01))
+    redirect = (cfg.get("public_url") or "https://" + getattr(REQ, "host", "")).rstrip("/") + "/auth/discord/callback"
+    url = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode({"client_id": cfg["client_id"], "response_type": "code", "redirect_uri": redirect,
+                                                                           "scope": "identify guilds.members.read", "state": state, "prompt": "none"})
+    return url, None
+
+
+def auth_callback(params, cookie_header):
+    """Discord sends the visitor back with a code: swap it for a token, read the visitor's roles on the community server, and sign the visit when the DATUM Verified role is there"""
+    cfg = discord_cfg()
+    saved = read_cookie(cookie_header, "dvs") or ""
+    state, _, nxt = saved.partition("~")
+    nxt = safe_next(urllib.request.unquote(nxt))
+    nxe = html.escape(nxt, quote=True)
+    if not cfg or not state or params.get("state") != state or not params.get("code"):
+        return None, page("Get verified", "<h1>Sign-in did not finish</h1><section class=card><p>The sign-in expired or was cancelled. <a href='/auth/discord?next=" + html.escape(urllib.request.quote(nxt, safe="/"), quote=True) + "'>Try again</a>.</p></section>")
+    redirect = (cfg.get("public_url") or "https://" + getattr(REQ, "host", "")).rstrip("/") + "/auth/discord/callback"
+    try:
+        tok = discord_call("https://discord.com/api/oauth2/token", {"client_id": cfg["client_id"], "client_secret": cfg["client_secret"], "grant_type": "authorization_code",
+                                                                      "code": params["code"], "redirect_uri": redirect})
+        member = discord_call("https://discord.com/api/users/@me/guilds/" + str(cfg["guild_id"]) + "/member", token=tok["access_token"])
+    except (OSError, ValueError, KeyError):
+        return None, page("Get verified", "<h1>You are not in the DATUM verified community yet</h1><section class=card><p>Join the community and verify with the DATUM Verify bot first (only miners "
+                          "that submit shares through DATUM Gateway can join), then sign in again.</p><p><a href='https://datumgateway.org'>datumgateway.org</a> · <a href='" + nxe + "'>Back</a></p></section>")
+    if str(cfg["role_id"]) not in [str(x) for x in member.get("roles", [])]:
+        return None, page("Get verified", "<h1>The DATUM Verified role is missing</h1><section class=card><p>You are on the server, but the DATUM Verify bot has not verified you yet. "
+                          "Verify with the bot, then sign in again.</p><p><a href='https://datumgateway.org'>datumgateway.org</a> · <a href='" + nxe + "'>Back</a></p></section>")
+    REQ.cookies.append(make_cookie("dv", "1", VERIFY_DAYS))
+    REQ.cookies.append("dvs=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+    return nxt, None
+
+
+# ---------- HTML ----------
+
+CSS = """
+:root{color-scheme:dark;--bg:#11131f;--surface:#1d1f31;--line:#2d3348;--text:#fff;--muted:#9ea4bc;--link:#1bd8f4;--gold:ACCENT}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:400 14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line)}
+header .brand{font:700 18px/1 system-ui;color:var(--text)}header .brand span{color:var(--gold)}
+form{display:flex;gap:8px;flex:1;max-width:560px}input{flex:1;min-width:0;background:#0b0d17;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:9px 12px;font:13px ui-monospace,Menlo,monospace}
+button{background:var(--gold);color:#1a1406;border:0;border-radius:8px;padding:0 14px;font-weight:600;cursor:pointer}
+main{max-width:1100px;margin:0 auto;padding:20px 16px 48px;display:grid;gap:18px}
+h1{font:600 20px/1.3 system-ui;margin:0}h2{font:600 15px/1.3 system-ui;margin:0 0 8px;color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px;overflow-x:auto}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:500;font-size:12.5px}
+td.r,th.r{text-align:right}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}.muted{color:var(--muted)}.wrap{white-space:normal;word-break:break-all}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
+.bhero{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}.bhero h1{font-size:24px}.bhero .navbtns{margin-left:auto;display:flex;gap:8px}.navbtns a{border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:6px 12px;font-size:13px;color:var(--text)}.navbtns a:hover{border-color:var(--gold);text-decoration:none}.navbtns span.off{border:1px solid var(--line);border-radius:8px;padding:6px 12px;font-size:13px;color:var(--muted);opacity:.5}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;background:#0b0d17;border:1px solid var(--line);font-size:12.5px;color:var(--muted)}.chip b{color:var(--gold);font-weight:600}
+.bhash{display:grid;gap:8px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:12px;padding:14px 18px}.bhtop{display:flex;align-items:center;justify-content:space-between;gap:12px}.bhash small{color:var(--gold);font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase}
+.bhash .bhv{word-break:break-all;font-size:clamp(15px,2.3vw,23px);font-weight:600;line-height:1.35;color:#fff;letter-spacing:.01em}.bhash .z{color:var(--gold);font-weight:700}.bhz{color:var(--muted);font-size:13px}.bhz b{color:var(--gold);font-weight:700}
+.bhcopy{background:#0b0d17;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 12px;font:500 12px/1.4 system-ui;cursor:pointer}.bhcopy:hover{color:#fff;border-color:var(--gold)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.tiles.wide{grid-template-columns:repeat(3,1fr)}@media(max-width:780px){.tiles.wide{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.tiles.wide{grid-template-columns:1fr}}.tile{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:grid;gap:3px;align-content:start;min-width:0}.tile small{color:var(--muted);font-size:12px;letter-spacing:.06em;text-transform:uppercase}.tile b{font:600 20px/1.2 ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.tile em{font-style:normal;color:var(--muted);font-size:12.5px}.tile .meter{height:6px;border-radius:3px;background:#0b0d17;border:1px solid var(--line);overflow:hidden;margin-top:4px}.tile .meter i{display:block;height:100%;background:var(--gold)}
+.locked{display:grid;gap:8px;justify-items:start;word-break:normal;overflow-wrap:break-word;max-width:62ch}.locked p{margin:0;line-height:1.5}div.locked{padding:12px 14px;border:1px solid var(--line);border-left:3px solid var(--gold);border-radius:8px;background:#0b0d17}.verify{display:inline-flex;gap:6px;align-items:center;background:var(--gold);color:#1a1406;border-radius:8px;padding:4px 12px;font-weight:600;font-size:13px}.verify:hover{text-decoration:none;filter:brightness(1.1)}
+.animsec{display:grid;gap:12px;padding:4px 0}.animsec h2{margin:0}.sec{font:600 12px/1.3 system-ui;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:10px 0 -6px}
+.diagrams{gap:12px}.diagrams .chart{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px;min-width:0}.diagrams .chart>h2{margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+
+.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));gap:14px}.groups .card h2{margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--line)}.groups dl{grid-template-columns:minmax(96px,max-content) 1fr;gap:8px 16px}.groups dd{min-width:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.stat b{display:block;font:600 20px/1.2 ui-monospace,Menlo,monospace}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,430px),1fr));gap:14px}.chart svg{width:100%;height:auto;color:var(--muted)}.chart h2{margin:0 0 4px}
+.chart.wide{grid-column:1/-1}.fill{display:flex;height:22px;border-radius:6px;background:#0b0d17;border:1px solid var(--line);overflow:hidden}.fill i{display:block;height:100%}
+.legend,.donut ul{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12.5px;color:var(--muted)}.legend i,.donut li i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}.legend b,.donut b{color:var(--text);font-weight:600}
+.donut{display:flex;align-items:center;gap:18px;flex-wrap:wrap}.donut svg{width:140px;height:140px;color:var(--text)}.donut ul{flex-direction:column;margin:0}
+.hb{display:grid;grid-template-columns:120px 1fr auto;gap:10px;align-items:center;margin:6px 0;font-size:12.5px}.hl{color:var(--muted)}.ht{height:12px;background:#0b0d17;border-radius:6px;overflow:hidden;border:1px solid var(--line)}.ht i{display:block;height:100%}.hv{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.animbar{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;margin-bottom:10px}.animbar button{padding:7px 14px}.animbar select{background:#0b0d17;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px}.animbar input[type=range]{flex:1;min-width:140px;accent-color:var(--gold)}
+.animwrap{position:relative;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:18px 34px;padding:6px 0 4px}
+.fan{display:block;flex:0 0 auto;width:clamp(240px,70vw,360px);aspect-ratio:1;--fan-color:rgba(255,255,255,.88)}.fan svg{width:100%;height:100%;overflow:visible;display:block}.fan .frame circle,.fan .rotor path{fill:none;stroke:var(--fan-color);stroke-linejoin:round;stroke-linecap:round}.fan .rotor path{stroke-width:1.6}.fan .frame circle{stroke-width:2.4}.fan .hub{fill:var(--fan-color)}.fan .hub-cut{fill:var(--bg)}
+.fan .rotor{transform-box:view-box;transform-origin:50px 50px}.fan.hashing .rotor{animation:spin .6s linear infinite}.fan.hashing{filter:drop-shadow(0 0 10px rgba(255,255,255,.45))}@keyframes spin{to{transform:rotate(360deg)}}.flylayer{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:2}.front{overflow:hidden}
+.block-wrap{--s:clamp(260px,74vw,360px);--d:clamp(44px,10vw,64px);flex:0 0 auto;width:calc(var(--s) + var(--d));display:grid;gap:8px;justify-items:center;margin:0;padding:6px 4px 0}
+.block-wrap .above{padding-left:var(--d);font:500 12px/1.3 system-ui,sans-serif;color:var(--muted)}.block-wrap .below{font:500 14px/1.3 system-ui,sans-serif;color:var(--muted);text-align:center}
+.height b{display:inline-block;padding:3px 8px;border-radius:3px;background:#232838;border:1px solid rgba(255,255,255,.10);border-top-color:rgba(255,255,255,.16);box-shadow:-2px 2px 0 0 rgba(25,28,39,.9);font:600 13px/1.15 ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;color:#e8ebf5}
+.cube{position:relative;filter:drop-shadow(0 26px 22px rgba(0,0,0,.55));width:var(--s);height:var(--s);margin:var(--d) 0 0 var(--d)}.face{position:absolute}.front{inset:0;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12),inset 0 2px 0 rgba(255,255,255,.18),inset 0 -40px 60px rgba(0,0,0,.22)}.front:after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.10),rgba(255,255,255,0) 38%,rgba(0,0,0,.14))}
+.top{left:0;top:calc(var(--d) * -1);width:var(--s);height:var(--d);transform-origin:bottom left;transform:skewX(45deg);background:linear-gradient(180deg,#4a526c,#313850);box-shadow:inset 0 1px 0 rgba(255,255,255,.22)}.side{left:calc(var(--d) * -1);top:0;width:var(--d);height:var(--s);transform-origin:top right;transform:skewY(45deg);background:linear-gradient(90deg,#10121b,#1b1f2d);box-shadow:inset 1px 0 0 rgba(255,255,255,.08)}
+.cube-coin{position:absolute;top:6px;left:6px;width:18px;height:18px;z-index:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45))}
+.txt{height:100%;display:grid;grid-template-rows:1fr auto auto;justify-items:center;align-items:center;padding:30px 8px 12px;font:400 14px/1.25 system-ui,sans-serif;color:#fff;text-align:center}
+.txt .fee{font-weight:600;font-size:17px}.txt .range{color:rgba(255,255,255,.8);font-size:13px}.txt .txs,.txt .time{font-size:13px}
+.mid{position:relative;width:100%;height:100%;display:grid;align-content:center;gap:5px;justify-items:center}.rlabel{font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:rgba(255,255,255,.75);opacity:0}
+.hx{position:absolute;box-sizing:border-box;text-align:center;white-space:pre;opacity:0;font:600 13.5px/1.35 ui-monospace,Menlo,monospace;color:#fff;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 3px rgba(0,0,0,.85),0 0 10px rgba(0,0,0,.55)}
+.hx.small{font:500 12.5px/1.3 system-ui,sans-serif;color:#d5d9ea}.hx.out{font:500 12.5px/1.3 ui-monospace,Menlo,monospace;color:#7dff9f}
+.lbl{position:absolute;left:0;right:0;text-align:center;opacity:0;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.16em;color:#7fe9ff;text-shadow:0 1px 3px rgba(0,0,0,.85)}.lbl.b{color:#ffb95c}
+.cube.hit{animation:hit .45s ease-out}@keyframes hit{0%{box-shadow:0 0 0 0 rgba(60,226,107,.7)}100%{box-shadow:0 0 0 12px rgba(60,226,107,0)}}summary{cursor:pointer;color:var(--muted);font-weight:600}details table{margin-top:10px}
+.err{color:#ff6b6b}.ok{color:#3ce26b}footer{color:var(--muted);font-size:12px;text-align:center;padding:0 16px 24px}
+""".replace("ACCENT", CFG["accent"])
+
+
+def page(title, body):
+    return ("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>" + html.escape(title) + " · " + NAME + " explorer</title><style>" + CSS + "</style></head><body>"
+            "<header><a class=brand href='/'>" + html.escape(NAME) + " <span>explorer</span></a>"
+            "<a href='/fee-auction' class=muted>Fee auction</a><a href='/package-sorting' class=muted>Package sorting</a><a href='/block-assembly' class=muted>Block assembly</a><a href='/forks' class=muted>Forks</a><form action='/search'><input name=q placeholder='Block height, block hash, transaction id or address' aria-label=Search>"
+            "<button>Search</button></form></header><main>" + body + "</main>"
+            "<footer>hashes.space</footer></body></html>")
+
+
+def btc(sats):
+    return "{:,.8f}".format(sats / 1e8).rstrip("0").rstrip(".") + " " + COIN
+
+
+def ago(t):
+    s = max(0, int(time.time() - t))
+    return str(s) + "s ago" if s < 60 else str(s // 60) + "m ago" if s < 3600 else str(s // 3600) + "h ago" if s < 86400 else str(s // 86400) + "d ago"
+
+
+def svg_chart(rows, key, title, unit, fmt, color):
+    """a small server-side line chart of one value per block (oldest left)"""
+    vals = [r_[key] for r_ in rows]
+    if len(vals) < 2:
+        return ""
+    w, h, pad = 520, 150, 34
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1
+    pts = " ".join("{:.1f},{:.1f}".format(pad + i * (w - pad - 8) / (len(vals) - 1), 10 + (h - 30) * (1 - (v - lo) / span)) for i, v in enumerate(vals))
+    return ("<div class=chart><h2>" + html.escape(title) + "</h2><svg viewBox='0 0 " + str(w) + " " + str(h) + "' role=img aria-label='" + html.escape(title) + "'>"
+            "<polyline fill=none stroke='" + color + "' stroke-width=1.6 points='" + pts + "'/>"
+            "<text x=2 y=16 fill=currentColor font-size=12.5>" + fmt(hi) + "</text><text x=2 y=" + str(h - 22) + " fill=currentColor font-size=12.5>" + fmt(lo) + "</text>"
+            "<text x=" + str(pad) + " y=" + str(h - 6) + " fill=currentColor font-size=12.5>" + "{:,}".format(rows[0]["height"]) + "</text>"
+            "<text x=" + str(w - 8) + " y=" + str(h - 6) + " text-anchor=end fill=currentColor font-size=12.5>" + "{:,}".format(rows[-1]["height"]) + " · " + unit + "</text></svg></div>")
+
+
+def charts():
+    rows = STATS.history_rows()
+    if len(rows) < 2:
+        return "<section class=card><h2>Charts</h2><p class=muted>The size and fee charts fill in as the node's statistics are read (a few minutes after start).</p></section>"
+    return ("<h2 class=sec>The last " + str(len(rows)) + " blocks the node keeps</h2><div class='charts diagrams'>"
+            + svg_chart(rows, "size", "Block size", "MB", lambda v: "{:.2f}".format(v / 1e6), "#f7931a")
+            + svg_chart(rows, "medianFeeRate", "Median fee rate", "sat/vB", lambda v: "{:g}".format(round(v, 1)), "#3ce26b")
+            + svg_chart(rows, "totalFees", "Fees per block", COIN, lambda v: "{:.3f}".format(v / 1e8), "#1bd8f4")
+            + svg_chart(rows, "txs", "Transactions per block", "txs", lambda v: "{:,}".format(v), "#f2b53c") + "</div>")
+
+
+def forks_page():
+    rows = ""
+    for t in chain_tips():
+        rows += ("<tr><td class=r>" + "{:,}".format(t["height"]) + "</td><td class=mono><a href='/block/" + t["hash"] + "'>" + t["hash"][:20] + "…</a></td><td>" + html.escape(t["status"])
+                 + "</td><td class=r>" + str(t["branchLength"]) + "</td><td class=muted>" + (ago(t["timestamp"]) if t["timestamp"] else "") + "</td></tr>")
+    return page("Forks", "<h1>Chain forks and stale blocks</h1><section class=card><table><tr><th class=r>Tip height</th><th>Tip hash</th><th>Status</th><th class=r>Branch length</th><th>Mined</th></tr>"
+                + rows + "</table></section><section class=card><p class=muted>The node lists every chain tip it has seen. <b>active</b> is the chain it follows; the others are blocks that were mined but lost the race "
+                "(<b>valid-fork</b>, <b>valid-headers</b>, <b>headers-only</b>) or were rejected (<b>invalid</b>). A branch length of 1 is a single stale block.</p></section>")
+
+
+def address_page(addr):
+    st = address_scan(addr)
+    if st["state"] == "done":
+        r_ = st["result"]
+        rows = "".join("<tr><td class='mono wrap'><a href='/tx/" + u["txid"] + "'>" + u["txid"][:20] + "…</a>:" + str(u["vout"]) + "</td><td class=r>" + (("{:,}".format(u["height"])) if u["height"] else "") + "</td><td class=r>" + btc(u["value"]) + "</td></tr>" for u in r_["unspents"])
+        return page("Address", "<h1>Address</h1><section class=card><dl><dt>Address</dt><dd class=mono>" + html.escape(addr) + "</dd><dt>Balance</dt><dd><b>" + btc(r_["balance"]) + "</b></dd><dt>Unspent outputs</dt><dd>"
+                    + "{:,}".format(r_["unspentCount"]) + "</dd><dt>Scanned at block</dt><dd>" + "{:,}".format(r_["scannedAtHeight"] or 0) + "</dd></dl></section>"
+                    "<section class=card><h2>Unspent outputs</h2><table><tr><th>Output</th><th class=r>Block</th><th class=r>Value</th></tr>" + rows + "</table></section>"
+                    "<section class=card><p class=muted>Read from the node's UTXO set. It shows what the address holds now, not its history: a node keeps no address index.</p></section>")
+    if st["state"] == "error":
+        return page("Address", "<h1>Address</h1><section class='card err'>" + html.escape(st["error"]) + "</section>")
+    wait = ("The node is scanning another address; this page tries again by itself." if st["state"] == "busy" else "The node is reading its whole UTXO set for this address. This takes a few minutes; the result is kept for 10 minutes.")
+    return page("Address", "<meta http-equiv=refresh content=10><h1>Address</h1><section class=card><p class=mono>" + html.escape(addr) + "</p><p>" + wait + "</p></section>")
+
+
+def tx_extras(txid):
+    """mempool projection (block, ETA, CPFP, replaceability) as table rows; none for a confirmed transaction"""
+    try:
+        pr = tx_projection(txid)
+    except Exception:  # noqa: BLE001
+        return []
+    where = ("Block " + str(pr["projectedBlock"] + 1) + " of the projection · about " + str(pr["etaMinutes"]) + " min") if pr["projectedBlock"] is not None else \
+        "Not in the first " + str(len(STATE["mempool"])) + " blocks; needs more than " + "{:g}".format(pr["minFeeOfLastProjected"] or 0) + " sat/vB"
+    rows = [("Projected", where), ("Effective fee rate", "{:g}".format(pr["effectiveFeeRate"]) + " sat/vB" + (" (the package it belongs to pays more)" if pr["effectiveFeeRate"] > pr["feeRate"] else "")),
+            ("Unconfirmed parents / children", str(pr["ancestors"]) + " / " + str(pr["descendants"])), ("In the mempool for", ago(time.time() - pr["age"]).replace(" ago", ""))]
+    return rows
+
+
+def old_tx_page(txid):
+    if CHAIN != "blake2b":
+        REQ.protected = True      # the block of a pruned transaction is not known, so its addresses stay hidden from visitors who are not verified
+    found = spent_or_pruned_tx(txid)
+    if not found:
+        raise ValueError("Transaction not found. This node is pruned: it knows transactions in its mempool, in the blocks it still keeps, and any with an unspent output; "
+                         "a transaction whose outputs are all spent and whose block is pruned cannot be read. Open it from its block, or use a full-node explorer.")
+    rows = "".join("<tr><td class=mono>" + str(n) + "</td><td class='mono wrap'>" + html.escape(out_label(o)) + "</td><td class=r>"
+                   + btc(round(float(o["value"]) * 1e8)) + "</td><td class=r>" + "{:,}".format(o.get("confirmations", 0)) + "</td></tr>" for n, o in found)
+    return page("Transaction", "<h1>Transaction</h1><section class=card><dl><dt>Txid</dt><dd class=mono>" + txid + "</dd></dl></section><section class=card><h2>Unspent outputs</h2><table>"
+                "<tr><th>#</th><th>Address</th><th class=r>Value</th><th class=r>Confirmations</th></tr>" + rows + "</table></section><section class=card><p class=muted>This node is pruned and no longer has the "
+                "block of this transaction, so only its outputs that are still unspent are shown (from the UTXO set). Its inputs and fee are not available.</p></section>")
+
+
+def home():
+    with STATE_LOCK:
+        err, info, count, blocks, projected = STATE["error"], STATE["info"], STATE["mempool_count"], STATE["blocks"], STATE["mempool"]
+    if not info:
+        try:
+            info = NODE.call("getblockchaininfo")
+        except Exception as exc:  # noqa: BLE001
+            err = err or str(exc)
+    state = ("<div class='card err'>The explorer is not serving the page's live stream yet: " + html.escape(err) + ". The Find Mempool page shows simulated blocks until this clears.</div>"
+             if err else "")
+    rows = "".join(
+        "<tr><td><a href='/block/" + b["id"] + "'>" + "{:,}".format(b["height"]) + "</a></td><td class=muted>" + ago(b["timestamp"]) + "</td><td>"
+        + html.escape(b["extras"]["pool"]["name"]) + "</td><td class=r>" + "{:,}".format(b["tx_count"]) + "</td><td class=r>" + "{:,.2f}".format(b["size"] / 1e6) + " MB</td><td class=r>"
+        + "~" + "{:g}".format(round(b["extras"]["medianFee"], 1)) + " sat/vB</td><td class=r>" + btc(b["extras"]["totalFees"]) + "</td></tr>" for b in blocks)
+    prow = "".join("<tr><td>" + ("Next block" if i == 0 else "+" + str(i)) + "</td><td class=r>" + "{:,}".format(p["nTx"]) + "</td><td class=r>"
+                   + "{:,.2f}".format(p["blockVSize"] / 1e6) + " MvB</td><td class=r>~" + "{:g}".format(p["medianFee"]) + " sat/vB</td></tr>" for i, p in enumerate(projected))
+    stats = [("Block height", "{:,}".format(info.get("blocks", 0))), ("Mempool", "{:,} txs".format(count))]
+    try:                                   # what else the node knows: the difficulty period, fees, the halving and its peers
+        da, fees, hv, net = difficulty_adjustment(), recommended_fees(), halving(), network()
+        stats += [("Next difficulty", "{:+.2f}%".format(da["difficultyChange"]) + " in " + "{:,}".format(da["remainingBlocks"]) + " blocks"),
+                  ("Difficulty period", "{:.1f}% done".format(da["progressPercent"])),
+                  ("Fees now", "{:g}".format(fees["fastestFee"]) + " / " + "{:g}".format(fees["hourFee"]) + " / " + "{:g}".format(fees["economyFee"]) + " sat/vB"),
+                  ("Next halving", "{:,}".format(hv["remainingBlocks"]) + " blocks"),
+                  ("Mempool size", "{:,.1f} MvB".format(net["mempool"]["vsize"] / 1e6))]
+    except Exception:  # noqa: BLE001
+        pass
+    return page("Latest blocks", "<h1>" + html.escape(NAME) + "</h1>" + state + "<div class=stats>"
+                + "".join("<div class='card stat'><span class=muted>" + k + "</span><b>" + v + "</b></div>" for k, v in stats)
+                + "</div><section class=card><h2>Latest blocks</h2><table><tr><th>Height</th><th>Mined</th><th>Pool</th><th class=r>Txs</th><th class=r>Size</th><th class=r>Median fee</th><th class=r>Fees</th></tr>"
+                + rows + "</table></section><section class=card><h2>Mempool, in blocks of 1 MvB</h2><table><tr><th>Block</th><th class=r>Txs</th><th class=r>Size</th><th class=r>Median fee</th></tr>"
+                + prow + "</table></section>" + charts())
+
+
+FEE_BANDS = [(0, 2, "under 2", "#4a5263"), (2, 5, "2–5", "#9ea4bc"), (5, 10, "5–10", "#1bd8f4"), (10, 20, "10–20", "#3ce26b"), (20, 50, "20–50", "#f2b53c"), (50, 1e12, "50 and up", "#f7931a")]
+TYPE_NAMES = {"witness_v0_keyhash": "SegWit P2WPKH", "witness_v1_taproot": "Taproot P2TR", "witness_v0_scripthash": "SegWit P2WSH", "scripthash": "P2SH", "pubkeyhash": "Legacy P2PKH",
+              "pubkey": "P2PK", "multisig": "Bare multisig", "nulldata": "OP_RETURN", "witness_unknown": "Other witness", "nonstandard": "Non-standard"}
+SVG_TEXT = "fill='currentColor' font-size='12.5'"
+
+
+def hbars(items, total, unit=""):
+    """horizontal bars (label, value, colour) as a share of total: plain HTML so they scale to any width"""
+    out = ""
+    for label, v, col in items:
+        pct = 100.0 * v / total if total else 0
+        out += ("<div class=hb><span class=hl>" + html.escape(label) + "</span><span class=ht><i style='width:" + "{:.2f}".format(max(pct, 0.4 if v else 0)) + "%;background:" + col + "'></i></span>"
+                "<span class=hv>" + "{:,}".format(v) + unit + " · " + "{:.1f}".format(pct) + "%</span></div>")
+    return out
+
+
+def svg_hist(buckets, title, xlabel, color):
+    """a column histogram (label, value) with the value on top of each column"""
+    w, h, pad = 520, 170, 22
+    top = max([v for _, v in buckets] + [1])
+    n = len(buckets)
+    slot = (w - 2 * pad) / n
+    parts = ""
+    for i, (lab, v) in enumerate(buckets):
+        bh = (h - 52) * v / top
+        x = pad + i * slot + slot * 0.12
+        parts += ("<rect x='{:.1f}' y='{:.1f}' width='{:.1f}' height='{:.1f}' rx=2 fill='{}'/>".format(x, h - 30 - bh, slot * 0.76, bh, color)
+                  + "<text x='{:.1f}' y='{:.1f}' text-anchor=middle ".format(x + slot * 0.38, h - 34 - bh) + SVG_TEXT + ">" + "{:,}".format(v) + "</text>"
+                  + "<text x='{:.1f}' y='{}' text-anchor=middle ".format(x + slot * 0.38, h - 16) + SVG_TEXT + ">" + html.escape(lab) + "</text>")
+    return ("<div class=chart><h2>" + html.escape(title) + "</h2><svg viewBox='0 0 " + str(w) + " " + str(h) + "' role=img aria-label='" + html.escape(title) + "'>" + parts
+            + "<text x='" + str(w // 2) + "' y='" + str(h - 3) + "' text-anchor=middle " + SVG_TEXT + ">" + html.escape(xlabel) + "</text></svg></div>")
+
+
+def svg_donut(parts, title, center):
+    """a donut of (label, value, colour) parts with the legend underneath"""
+    import math
+    tot = sum(v for _, v, _ in parts) or 1
+    r_, cx, cy, sw = 52, 70, 70, 20
+    circ = 2 * math.pi * r_
+    off, arcs, legend = 0.0, "", ""
+    for lab, v, col in parts:
+        ln = circ * v / tot
+        arcs += "<circle cx={} cy={} r={} fill=none stroke='{}' stroke-width={} stroke-dasharray='{:.2f} {:.2f}' stroke-dashoffset='{:.2f}' transform='rotate(-90 {} {})'/>".format(cx, cy, r_, col, sw, ln, circ - ln, -off, cx, cy)
+        off += ln
+        legend += "<li><i style='background:" + col + "'></i>" + html.escape(lab) + " <b>" + "{:.1f}".format(100.0 * v / tot) + "%</b></li>"
+    return ("<div class=chart><h2>" + html.escape(title) + "</h2><div class=donut><svg viewBox='0 0 140 140' role=img aria-label='" + html.escape(title) + "'>" + arcs
+            + "<text x=70 y=74 text-anchor=middle fill=currentColor font-size=15 font-weight=600>" + html.escape(center) + "</text></svg><ul>" + legend + "</ul></div></div>")
+
+
+def svg_rate_range(pc):
+    """box plot of the block's fee rates (10th, 25th, median, 75th, 90th percentile) on a log scale"""
+    import math
+    if not pc or len(pc) < 5:
+        return ""
+    lo, hi = math.log10(max(0.5, min(pc) * 0.8)), math.log10(max(pc) * 1.25 + 1)
+    w, x0, x1 = 520, 20, 500
+    X = lambda v: x0 + (x1 - x0) * (math.log10(max(v, 0.01)) - lo) / (hi - lo)  # noqa: E731
+    ticks = [t for t in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000) if 10 ** lo <= t <= 10 ** hi]
+    g = "".join("<line x1={0:.1f} x2={0:.1f} y1=20 y2=78 stroke='#2d3348'/><text x={0:.1f} y=94 text-anchor=middle ".format(X(t)) + SVG_TEXT + ">" + str(t) + "</text>" for t in ticks)
+    box = ("<line x1={:.1f} x2={:.1f} y1=49 y2=49 stroke='#9ea4bc' stroke-width=2 />".format(X(pc[0]), X(pc[4]))
+           + "<rect x={:.1f} y=32 width={:.1f} height=34 rx=3 fill='#1bd8f4' fill-opacity=.35 stroke='#1bd8f4'/>".format(X(pc[1]), max(2, X(pc[3]) - X(pc[1])))
+           + "<line x1={0:.1f} x2={0:.1f} y1=28 y2=70 stroke='#f7931a' stroke-width=3 />".format(X(pc[2]))
+           + "<text x={:.1f} y=14 text-anchor=middle ".format(X(pc[2])) + SVG_TEXT + ">median " + "{:g}".format(round(pc[2], 1)) + "</text>"
+           + "<text x={:.1f} y=14 text-anchor=middle ".format(X(pc[0])) + SVG_TEXT + ">10% " + "{:g}".format(round(pc[0], 1)) + "</text>"
+           + "<text x={:.1f} y=14 text-anchor=middle ".format(X(pc[4])) + SVG_TEXT + ">90% " + "{:g}".format(round(pc[4], 1)) + "</text>")
+    return "<div class=chart><h2>Fee rates paid (sat/vB, log scale)</h2><svg viewBox='0 0 520 100' role=img aria-label='Fee rate range'>" + g + box + "</svg></div>"
+
+
+ANIM_MAX = 2500           # transactions of a block that the animation holds
+ANIM_JS = r"""(function(){
+var D=__DATA__, T=D.txs, N=T.length, DUR=8000, HEX="0123456789abcdef";
+var $=function(i){return document.getElementById(i)};
+var fan=$("anim-fan"),cube=$("anim-cube"),front=$("anim-front"),layer=$("anim-layer"),cTx=$("anim-ctx"),rng=$("anim-seek"),lab=$("anim-label"),lnk=$("anim-link");
+function clamp(x){return x<0?0:x>1?1:x}function ease(t){return t*t*(3-2*t)}
+var cum=[],acc=0;for(var i=0;i<N;i++){acc+=T[i].vs;cum.push(acc)}
+function el(cls,parent,txt){var e=document.createElement("div");e.className=cls;if(txt)e.textContent=txt;parent.appendChild(e);return e}
+var lblA=el("lbl",layer,"SENDER TRANSACTION"),lblB=el("lbl b",layer,"RECEIVING TRANSACTION");
+var h1=el("hx",layer),h2=el("hx",layer),more=el("hx small",layer),meta=el("hx small",layer),outs=[el("hx out",layer),el("hx out",layer),el("hx out",layer)];
+var EMPTY="#2d3348",M1="#9339f4",M2="#105fb0";
+function setFill(n){var done=n>0?cum[n-1]/Math.max(1,D.totalVs):0,pct=Math.max(4,Math.min(100,D.full*done)),e=100-pct;
+ front.style.background="repeating-linear-gradient("+EMPTY+","+EMPTY+" "+e+"%,"+M1+" "+e+"%,"+M2+" 100%)";
+ cTx.textContent=n.toLocaleString()+" / "+D.total.toLocaleString()+" transactions · "+(D.size*done/1e6).toFixed(2)+" MB"}
+function two(h){return h.slice(0,32)+"\n"+h.slice(32)}
+// the sender's hash turns, character by character, into the hash of the receiving transaction
+function morph(a,b,t){var o="";for(var i=0;i<b.length;i++){var c=b.charAt(i);if(c==="\n"){o+=c;continue}var sw=((i*37)%64)/64*0.55;o+=t<sw?(a.charAt(i)||" "):t<sw+0.25?HEX.charAt(Math.random()*16|0):c}return o}
+function pad(s,n){while(s.length<n)s+=" ";return s}
+var geo=null;function measure(){var a=layer.getBoundingClientRect(),m=a.height;geo={w:a.width,cx:a.width/2,cy:a.height*0.47,hw:Math.min(360,a.width*0.94)}}
+var pos=0,playing=false,last=0,shown=-1,hitAt=-1;
+function place(e,y,x,op,sc){e.style.width=geo.hw+"px";e.style.left=(geo.cx-geo.hw/2+x)+"px";e.style.top=y+"px";e.style.opacity=op;e.style.transform=sc&&sc!==1?"scale("+sc+")":"none"}
+function render(){
+ if(!geo)measure();
+ var i=Math.min(N-1,Math.floor(pos)),p=pos-i,t=T[i],id=t.id,g=geo,cy=g.cy,w=g.hw;
+ setFill(p>=0.64?i+1:i);
+ if(p>=0.64&&hitAt!==i){hitAt=i;cube.classList.remove("hit");void cube.offsetWidth;cube.classList.add("hit")}
+ if(shown!==i){shown=i;rng.value=i;lab.textContent="Transaction "+(i+1).toLocaleString()+" of "+N.toLocaleString()+(D.total>N?" (first "+N.toLocaleString()+" of "+D.total.toLocaleString()+")":"");lnk.textContent=id.slice(0,20)+"…";lnk.href="/tx/"+id+"?b="+D.hash}
+ fan.classList.toggle("hashing",p>0.02&&p<0.46);
+ front.style.filter="brightness("+(1+0.35*Math.max(0,1-Math.abs(p-0.64)/0.06))+")";
+ var out=1-clamp((p-0.94)/0.06);
+ // 1. the sender hashes fly out of the fan into the block
+ var s1=ease(clamp(p/0.28)),s2=ease(clamp((p-0.07)/0.28)),m=clamp((p-0.42)/0.2),em=ease(m);
+ var send1=t.cb?pad("COINBASE · NEWLY CREATED COINS\n",65):two(t.ins[0].h),mainY=cy-86+36*em;
+ var x1=-(w+40)*(1-s1);
+ h1.textContent=m>0?(m>=1?two(id):morph(send1,two(id),m)):send1;
+ place(h1,mainY,x1,Math.min(1,s1*3)*out,1);
+ var s2h=t.ins[1]?two(t.ins[1].h):"";
+ if(s2h){h2.textContent=s2h;place(h2,cy-40-(cy-40-mainY)*em,-(w+40)*(1-s2),Math.min(1,s2*3)*(1-clamp(em*1.3))*out,1)}else place(h2,cy,0,0,1);
+ var extra=t.nin-(t.cb?1:Math.min(2,t.ins.length));
+ if(extra>0&&!t.cb){more.textContent="+"+extra+" more sender"+(extra>1?"s":"");place(more,cy-2,0,clamp((p-0.2)/0.1)*(1-clamp((p-0.4)/0.08))*out,1)}else place(more,cy,0,0,1);
+ place(lblA,cy-112,0,clamp((p-0.08)/0.12)*(1-clamp((p-0.46)/0.08))*out,1);
+ place(lblB,cy-112,0,clamp((p-0.5)/0.1)*out,1);
+ // 2. resolved in the receiving transaction: its fee and size, then the outputs it creates
+ meta.textContent=t.nin+" in → "+t.nout+" out · "+(t.cb?"coinbase":t.r+" sat/vB")+" · "+t.vs+" vB";
+ place(meta,cy-6,0,clamp((p-0.64)/0.08)*out,1);
+ for(var j=0;j<3;j++){var e=outs[j],x=t.outs[j];
+  if(!x){place(e,cy,0,0,1);continue}
+  var a=0.68+0.06*j,s=ease(clamp((p-a)/0.14));
+  e.textContent=(/^\+/.test(x[0])?x[0]:"#"+j+"  "+x[0]+(x[1]?" · "+x[1]:""));
+  place(e,cy+22+j*24+(1-s)*-14,0,s*out,1)}
+}
+function tick(now){var dt=now-last;last=now;if(playing){pos+=dt/DUR;if(pos>=N-0.001)pos=0;render()}requestAnimationFrame(tick)}
+rng.max=N-1;rng.oninput=function(){pos=+rng.value;render()};
+window.addEventListener("resize",function(){geo=null;render()});
+render();requestAnimationFrame(function(n){last=n;tick(n)});
+var started=false,go=function(){if(!started){started=true;playing=true}};
+if("IntersectionObserver" in window){new IntersectionObserver(function(es){if(es[0].isIntersecting)go()},{threshold:0.5}).observe(cube)}else go();
+})();
+"""
+
+
+def short_addr(a):
+    return a if len(a) <= 22 else a[:11] + "…" + a[-6:]
+
+
+FAN_SVG = ("<svg viewBox='0 0 100 100' aria-hidden=true><g class=frame><circle cx=50 cy=50 r=40 stroke-width=4.2></circle><circle cx=12 cy=12 r=4.6 stroke-width=3></circle><circle cx=88 cy=12 r=4.6 stroke-width=3></circle>"
+           "<circle cx=12 cy=88 r=4.6 stroke-width=3></circle><circle cx=88 cy=88 r=4.6 stroke-width=3></circle></g><g class=rotor><g transform='translate(50 50)'>"
+           + "".join("<path transform='rotate(" + str(a) + ")' d='M -4.5,-8.5 C -10,-17 -9,-27 -1.5,-35.5 Q 12,-34 17.5,-24.5 C 10,-22 6,-16 5,-9'></path>" for a in (0, 72, 144, 216, 288))
+           + "<circle r=10.5 class=hub></circle><polygon class=hub-cut points='0,-5.6 5.3,-1.7 3.3,4.5 -3.3,4.5 -5.3,-1.7'></polygon></g></g></svg>")
+# the hashes.space fan on a small block of its own, in the faces and colours of the blocks; it spins while a transaction's hashes are on their way in
+FAN_HTML = "<span class=fan id=anim-fan>" + FAN_SVG + "</span>"
+
+
+def cube_html(b, st, pool):
+    """the block as the Find Mempool page draws it: the 3D block with its height, coin, fee rate and transaction count; the middle of its front face is where the transactions resolve"""
+    coin = "<svg class=cube-coin viewBox='0 0 32 32'><circle cx=16 cy=16 r=16 fill='" + CFG["accent"] + "'/><text x=16 y=22.5 text-anchor=middle font-size=19 font-weight=700 fill='#fff'>₿</text></svg>"
+    return ("<div class=block-wrap><div class='above height'><b>" + "{:,}".format(b["height"]) + "</b></div><div class=cube id=anim-cube><div class='face front' id=anim-front style='background:#2d3348'>" + coin + "<div class=txt>"
+            "<div class=mid id=anim-mid></div><span class=txs id=anim-ctx>0 transactions</span><span class=time>" + ago(b["time"]) + "</span></div><div class=flylayer id=anim-layer></div></div>"
+            "<div class='face top'></div><div class='face side'></div></div><div class=below>" + html.escape(pool) + "</div></div>")
+
+
+def block_animation(b, h):
+    """each transaction of the block as an animation: the coins it spends (sending) and the outputs it creates (receiving), flying into the block"""
+    txs = b["tx"]
+    data = []
+    rates = sorted(float(t["fee"]) * 1e8 / t["vsize"] for t in txs[1:] if "fee" in t and t.get("vsize"))
+    st = {"med": round(rates[len(rates) // 2], 1) if rates else 0, "lo": round(rates[0]) if rates else 0, "hi": round(rates[-1]) if rates else 0}
+    cb0 = txs[0]
+    addrs0 = [o.get("scriptPubKey", {}).get("address") for o in cb0.get("vout", []) if o.get("scriptPubKey", {}).get("address")]
+    pool = POOLS.find(bytes.fromhex(cb0["vin"][0].get("coinbase", "")).decode("latin-1"), addrs0)
+    for t in txs[:ANIM_MAX]:
+        cb = "coinbase" in t["vin"][0]
+        ins = []
+        for i in t["vin"][:3]:
+            if "coinbase" in i:
+                ins.append(["Coinbase", "newly created coins"])
+                continue
+            po = i.get("prevout") or {}
+            who = out_label(po, True) if po.get("scriptPubKey", {}).get("address") else ""
+            ins.append({"h": i["txid"], "n": i["vout"]})
+        ins = ins[:2]
+        outs = [[out_label(o, True), btc(round(float(o["value"]) * 1e8))] for o in t["vout"][:3]]
+        if len(t["vout"]) > 3:
+            outs[2] = ["+" + str(len(t["vout"]) - 2) + " more outputs", ""]
+        rate = round(float(t["fee"]) * 1e8 / t["vsize"], 1) if "fee" in t and t.get("vsize") else 0
+        data.append({"id": t["txid"], "idf": t["txid"], "cb": cb, "nin": len(t["vin"]), "nout": len(t["vout"]), "vs": t.get("vsize", 0), "r": rate, "ins": ins, "outs": outs})
+    blob = json.dumps({"height": "{:,}".format(b["height"]), "hash": h, "total": len(txs), "size": b["size"], "full": min(100.0, b["weight"] / 40000.0),
+                           "totalVs": sum(t.get("vsize", 0) for t in txs), "txs": data}, separators=(",", ":")).replace("</", "<\\/")
+    return ("<section class=animsec><h2>Every transaction hash going into block " + "{:,}".format(b["height"]) + "</h2><div class=animbar>"
+            "<input id=anim-seek type=range min=0 value=0 aria-label='Transaction'><span id=anim-label class=muted></span><a id=anim-link class=mono href='#'></a></div>"
+            "<div class=animwrap id=anim-wrap>" + FAN_HTML + cube_html(b, st, pool)
+            + "</div>"
+            "<p class=muted>Each transaction in turn: the coins it spends (sending) travel into the block, then the outputs it creates (receiving) resolve in the middle of it, and the block fills.</p>"
+            "<script>" + ANIM_JS.replace("__DATA__", blob) + "</script></section>")
+
+
+def block_diagrams(b):
+    """the diagrams of a block page, worked out from the transactions of the block"""
+    txs = b["tx"][1:]
+    sub = SUBSIDY0 >> (b["height"] // 210000)
+    fees = sum(round(float(t.get("fee", 0)) * 1e8) for t in txs)
+    rated = [(float(t["fee"]) * 1e8 / t["vsize"], t["vsize"]) for t in txs if "fee" in t and t.get("vsize")]
+    out = ""
+    full = min(100.0, b["weight"] / 40000.0)
+    bands = []
+    for lo, hi, lab, col in FEE_BANDS:
+        v = sum(vs for rt, vs in rated if lo <= rt < hi)
+        bands.append((lab + " sat/vB", v, col))
+    tv = sum(v for _, v, _ in bands) or 1
+    seg = "".join("<i style='width:" + "{:.3f}".format(100.0 * v / tv * full / 100) + "%;background:" + col + "' title='" + lab + ": " + "{:.1f}".format(100.0 * v / tv) + "% of the block'></i>" for lab, v, col in bands)
+    out += ("<div class='chart wide'><h2>What fills the block: " + "{:.1f}".format(full) + "% of the weight limit, by fee rate</h2><div class=fill>" + seg + "</div><ul class=legend>"
+            + "".join("<li><i style='background:" + col + "'></i>" + lab + " <b>" + "{:.1f}".format(100.0 * v / tv) + "%</b></li>" for lab, v, col in bands) + "</ul></div>")
+    edges = [(0, 2), (2, 3), (3, 5), (5, 8), (8, 12), (12, 20), (20, 35), (35, 60), (60, 120), (120, 1e12)]
+    labs = ["<2", "2", "3–5", "5–8", "8–12", "12–20", "20–35", "35–60", "60–120", "120+"]
+    out += svg_hist([(labs[i], sum(1 for rt, _ in rated if lo <= rt < hi)) for i, (lo, hi) in enumerate(edges)], "Transactions by fee rate", "sat/vB", "#f7931a")
+    sizes = [(0, 150, "<150"), (150, 250, "150–250"), (250, 400, "250–400"), (400, 700, "400–700"), (700, 1500, "700–1.5k"), (1500, 1e12, "1.5k+")]
+    out += svg_hist([(lab, sum(1 for t in txs if lo <= t.get("vsize", 0) < hi)) for lo, hi, lab in sizes], "Transactions by size", "vBytes", "#3ce26b")
+    cnt = {}
+    for t in txs:
+        for o in t["vout"]:
+            k = o.get("scriptPubKey", {}).get("type", "nonstandard")
+            cnt[k] = cnt.get(k, 0) + 1
+    cols = ["#f7931a", "#1bd8f4", "#3ce26b", "#f2b53c", "#9ea4bc", "#ff4d4d", "#4a5263", "#454d68"]
+    items = [(TYPE_NAMES.get(k, k), v, cols[i % len(cols)]) for i, (k, v) in enumerate(sorted(cnt.items(), key=lambda x: -x[1])[:8])]
+    out += "<div class=chart><h2>Output types</h2>" + hbars(items, sum(cnt.values())) + "</div>"
+    out += svg_donut([("Subsidy", sub, "#4a5263"), ("Fees", fees, "#f7931a")], "Miner reward", "{:.3f}".format((sub + fees) / 1e8))
+    try:
+        pc = NODE.call("getblockstats", b["hash"], ["feerate_percentiles"], timeout=60).get("feerate_percentiles")
+    except Exception:  # noqa: BLE001
+        pc = None
+    out += svg_rate_range(pc)
+    return "<h2 class=sec>Block diagrams</h2><div class='charts diagrams'>" + out + "</div>"
+
+
+def difficulty_text(b):
+    """the block's difficulty. The BLAKE2b chain's node reports 0 (its 'difficulty' is measured against the SHA-256 limit), so there it is the hashes a block takes, worked out from the header's bits"""
+    d = b.get("difficulty") or 0
+    if CHAIN != "blake2b" and d:
+        return "{:,.0f}".format(d)
+    try:
+        w = bits_work(b["bits"])
+    except (KeyError, ValueError):
+        return "{:,.0f}".format(d)
+    return "{:,}".format(w) + " <span class=muted>hashes per block</span>"
+
+
+def header_rows(b):
+    """the block header as the node reports it (getblock / getblockheader): version and signalling, merkle root, bits, nonce, chainwork, median time"""
+    ver = b.get("version")
+    rows = []
+    if ver is not None:
+        rows.append(("Version", "0x{:08x}".format(ver) + (" · BIP9 signalling" if (ver >> 29) == 1 else "")))
+    if b.get("merkleroot"):
+        rows.append(("Merkle root", "<span class=mono>" + str(b["merkleroot"]) + "</span>"))
+    if b.get("bits"):
+        rows.append(("Bits", "<span class=mono>" + str(b["bits"]) + "</span>"))
+    if "nonce" in b:
+        rows.append(("Nonce", "{:,}".format(b["nonce"])))
+    if b.get("mediantime"):
+        rows.append(("Median time", time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(b["mediantime"]))))
+    if b.get("chainwork"):
+        rows.append(("Chainwork", "<span class=mono>" + str(b["chainwork"]).lstrip("0") + "</span> (2^{:.2f} hashes)".format(__import__("math").log2(max(1, int(b["chainwork"], 16))))))
+    return rows
+
+
+def block_layout(height, nav_prev, nav_next, pool, mined, hash_, tiles, groups, extra="", conf=None):
+    """structured block page: title row (height, pool, time, previous/next), the hash, key figures as tiles, then the details grouped in cards"""
+    def btn(href, label):
+        return "<a href='/block/" + href + "'>" + label + "</a>" if href else "<span class=off>" + label + "</span>"
+    head = ("<div class=bhero><h1>Block " + "{:,}".format(height) + "</h1>" + ("<span class=chip>Mined by <b>" + html.escape(pool) + "</b></span>" if pool else "")
+            + "<span class=chip>" + mined + "</span>" + ("<span class=chip><b>" + "{:,}".format(conf) + "</b> confirmation" + ("" if conf == 1 else "s") + "</span>" if conf is not None else "") + "<div class=navbtns>" + btn(nav_prev, "← previous") + btn(nav_next, "next →") + "</div></div>"
+            + "<div class=bhash><div class=bhtop><small>Block hash</small><button type=button class=bhcopy onclick=\"var b=this;navigator.clipboard&&navigator.clipboard.writeText('" + hash_
+            + "').then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1500)})\">Copy</button></div>"
+            + "<span class='mono bhv'>" + "<span class=z>0</span>" * (len(hash_) - len(hash_.lstrip("0"))) + hash_.lstrip("0") + "</span>"
+            + "<span class=bhz><b>" + str(len(hash_) - len(hash_.lstrip("0"))) + "</b> leading zero" + ("" if len(hash_) - len(hash_.lstrip("0")) == 1 else "s") + "</span></div>")
+    tl = "".join("<div class=tile><small>" + k + "</small><b>" + v + "</b>" + (("<em>" + sub + "</em>") if sub else "") + (("<div class=meter><i style='width:" + "{:.1f}".format(min(100.0, bar)) + "%'></i></div>") if bar is not None else "") + "</div>"
+                 for k, v, sub, bar in tiles)
+    gr = "".join("<section class=card><h2>" + t + "</h2><dl>" + "".join("<dt>" + k + "</dt><dd>" + v + "</dd>" for k, v in rows) + "</dl></section>" for t, rows in groups if rows)
+    return head + "<div class=tiles>" + tl + "</div><div class=groups>" + gr + "</div>" + extra
+
+
+def block_stats_card(h):
+    try:
+        st = block_statistics(h)
+    except Exception:  # noqa: BLE001
+        return ""
+    p = st.get("feeRatePercentiles") or []
+    seg, tap = st["segwitShare"] * 100, st["taprootShare"] * 100
+    items = [("Average fee", btc(st["avgFee"]), "{:.1f} sat/vB on average".format(st["avgFeeRate"]), None), ("Median fee", btc(st["medianFee"]), "per transaction", None),
+             ("Fee rate range", ("{:g} – {:g}".format(st["minFeeRate"], st["maxFeeRate"])) if p else "-", "sat/vB, lowest to highest", None),
+             ("Total sent", btc(st["totalOut"]), "moved by the transactions", None),
+             ("SegWit", "{:.1f}%".format(seg), "of the transactions", seg), ("Taproot", "{:.1f}%".format(tap), "of the transactions", tap),
+             ("Inputs / outputs", "{:,} / {:,}".format(st["inputs"], st["outputs"]), "{:,} OP_RETURN outputs".format(st["opReturnOutputs"]), None),
+             ("Average transaction", "{:,} B".format(st["avgTxSize"]), "bytes per transaction", None),
+             ("UTXO set", "{:+,}".format(st["utxoIncrease"]), "outputs added minus spent", None)]
+    return ("<h2 class=sec>Block statistics</h2><div class='tiles wide'>" + "".join(
+        "<div class=tile><small>" + k + "</small><b style='font-size:17px'>" + v + "</b><em>" + sub + "</em>"
+        + (("<div class=meter><i style='width:" + "{:.1f}".format(min(100.0, bar)) + "%'></i></div>") if bar is not None else "") + "</div>" for k, v, sub, bar in items) + "</div>")
+
+
+def block_page(ident):
+    h = NODE.call("getblockhash", int(ident)) if ident.isdigit() else ident
+    if not HEX64.fullmatch(h):
+        raise ValueError("not a block")
+    try:
+        b = NODE.call("getblock", h, 2, timeout=120)
+    except RuntimeError as exc:
+        hd = NODE.call("getblockheader", h)       # the header is never pruned
+        tiles = [("Difficulty", difficulty_text(hd), "", None)]
+        note = ("<section class=card><p class=muted>This node is pruned: it has deleted the transactions of this block (" + html.escape(str(exc))
+                + "), but a node never prunes a block's header, which is shown above.</p></section>")
+        return page("Block " + str(hd["height"]), block_layout(hd["height"], hd.get("previousblockhash"), hd.get("nextblockhash"), "",
+                    time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(hd["time"])) + " (" + ago(hd["time"]) + ")", h,
+                    tiles, [("Header", header_rows(hd))], note, conf=hd.get("confirmations", 0)))
+    txs = b["tx"]
+    fees = sum(round(float(t.get("fee", 0)) * 1e8) for t in txs[1:])
+    cb = txs[0]
+    text = bytes.fromhex(cb["vin"][0].get("coinbase", "")).decode("latin-1")
+    addrs = [o.get("scriptPubKey", {}).get("address") for o in cb.get("vout", []) if o.get("scriptPubKey", {}).get("address")]
+    pool = POOLS.find(text, addrs)
+    protect(pool)
+    subsidy = SUBSIDY0 >> (b["height"] // 210000)
+    full = b["weight"] / 40000
+    tiles = [("Reward", btc(fees + subsidy), "subsidy " + btc(subsidy) + " + fees", None),
+             ("Transaction fees", btc(fees), "paid by the {:,} transactions in this block".format(len(txs) - 1), None)]
+    hdr = [("Difficulty", difficulty_text(b))] + header_rows(b)
+    return page("Block " + str(b["height"]), block_layout(b["height"], b.get("previousblockhash"), b.get("nextblockhash"), pool,
+                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(b["time"])) + " (" + ago(b["time"]) + ")", h, tiles,
+                [("Header", hdr)], conf=b.get("confirmations", 0))
+                + block_stats_card(h))  # the transaction animation (block_animation) is hidden for now
+
+
+def pool_of_hash(block_hash):
+    """the pool that mined a block, from its coinbase"""
+    cb = NODE.call("getrawtransaction", NODE.call("getblock", block_hash, 1)["tx"][0], True, block_hash)
+    addrs = [o.get("scriptPubKey", {}).get("address") for o in cb.get("vout", []) if o.get("scriptPubKey", {}).get("address")]
+    return POOLS.find(bytes.fromhex(cb["vin"][0].get("coinbase", "")).decode("latin-1"), addrs)
+
+
+def block_mining(ident):
+    """the pool information of one block, for the pool page on hashes.space: the pool (and the miner it names), the text in the coinbase,
+    and who the block reward was paid to, read from the coinbase transaction alone (cheap, whatever the size of the block)"""
+    h = NODE.call("getblockhash", int(ident)) if ident.isdigit() else ident
+    if not HEX64.fullmatch(h):
+        raise ValueError("not a block")
+    b = NODE.call("getblock", h, 1, timeout=120)
+    cb = NODE.call("getrawtransaction", b["tx"][0], True, h)
+    raw = cb["vin"][0].get("coinbase", "")
+    text = bytes.fromhex(raw).decode("latin-1")
+    paid = {}
+    for o in cb.get("vout", []):
+        a = o.get("scriptPubKey", {}).get("address")
+        if a:
+            paid[a] = paid.get(a, 0) + round(float(o["value"]) * 1e8)
+    pool, miner = POOLS.find_full(text, list(paid))
+    return {"id": b["hash"], "height": int(b["height"]), "timestamp": int(b["time"]), "pool": pool, "miner": miner or "",
+            "coinbaseText": "".join(c if 32 <= ord(c) < 127 else "\u00b7" for c in text), "coinbaseRaw": raw,
+            "reward": round(sum(float(o["value"]) for o in cb.get("vout", [])) * 1e8),
+            "paidTo": [{"address": a, "sats": s} for a, s in paid.items()] if (CHAIN == "blake2b" or pool != PROTECTED_POOL or getattr(REQ, "ok", False)) else []}
+
+
+def tx_page(txid, block_hash):
+    try:
+        tx = NODE.call("getrawtransaction", txid, 2, *([block_hash] if block_hash else []))
+    except RuntimeError:
+        try:
+            tx = NODE.call("getrawtransaction", txid, True, *([block_hash] if block_hash else []))
+        except RuntimeError:
+            return old_tx_page(txid)
+    if CHAIN != "blake2b" and (tx.get("blockhash") or block_hash):      # Bitcoin (BLAKE2b protects nothing): only transactions of blocks mined by the protected pool hide their addresses
+        try:
+            protect(pool_of_hash(tx.get("blockhash") or block_hash))
+        except (RuntimeError, ValueError, KeyError, IndexError):
+            REQ.protected = True      # the pool of the block is not known: stay on the safe side and hide the addresses
+    ins = "".join("<tr><td class='mono wrap'>" + ("coinbase" if "coinbase" in i else "<a href='/tx/" + i["txid"] + "'>" + i["txid"][:16] + "…</a>:" + str(i["vout"])) + "</td></tr>" for i in tx["vin"])
+    outs = "".join("<tr><td class=mono>" + str(n) + "</td><td class='mono wrap'>" + html.escape(out_label(o)) + "</td><td class=r>"
+                   + btc(round(float(o["value"]) * 1e8)) + "</td></tr>" for n, o in enumerate(tx["vout"]))
+    bh = tx.get("blockhash")
+    rows = [("Txid", "<span class=mono>" + tx["txid"] + "</span>"),
+            ("Status", ("In block <a href='/block/" + bh + "'>" + bh[:16] + "…</a> · " + "{:,}".format(tx.get("confirmations", 0)) + " confirmations") if bh else "In the mempool, waiting for a block"),
+            ("Size", "{:,} bytes · {:,} vB".format(tx["size"], tx["vsize"])), ("Total out", btc(round(sum(float(o["value"]) for o in tx["vout"]) * 1e8)))]
+    if "fee" in tx:
+        rows.append(("Fee", btc(round(float(tx["fee"]) * 1e8)) + " (" + "{:.1f}".format(float(tx["fee"]) * 1e8 / tx["vsize"]) + " sat/vB)"))
+    if not bh:
+        rows += tx_extras(txid)
+    return page("Transaction", "<h1>Transaction</h1><section class=card><dl>" + "".join("<dt>" + k + "</dt><dd>" + v + "</dd>" for k, v in rows)
+                + "</dl></section><section class=card><h2>Inputs</h2><table>" + ins + "</table></section><section class=card><h2>Outputs</h2><table><tr><th>#</th><th>Address</th><th class=r>Value</th></tr>"
+                + outs + "</table></section>")
+
+
+MAX_CONNECTIONS = 256          # open connections at once; more get a quick "busy" answer instead of one more thread
+MAX_WS = 64                    # live (WebSocket) connections at once
+MAX_WS_FRAME = 65536           # bytes a visitor may send in one WebSocket message
+_ws_open = [0]
+
+
+class CappedServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+    _slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            return self.shutdown_request(request)
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = CHAIN + "-explorer"
+    protocol_version = "HTTP/1.1"
+    timeout = 30                  # a client that stops sending (slow-loris) is dropped after 30 s; live connections set their own
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", cache=0):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=" + str(cache) if cache else "no-store")
+        for c in getattr(REQ, "cookies", []):
+            self.send_header("Set-Cookie", c)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def json(self, obj, cache=0):
+        self.send(200, json.dumps(obj), "application/json", cache)
+
+    def do_GET(self):  # noqa: N802
+        path, _, query = self.path.partition("?")
+        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        REQ.cookies, REQ.path, REQ.host = [], self.path, self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
+        REQ.ok = read_cookie(self.headers.get("Cookie"), "dv") == "1"
+        REQ.protected = False      # block and transaction pages of the Bitcoin explorer narrow this down to the pool that mined the block
+        try:
+            if path == "/auth/discord":
+                url, html_ = auth_start(safe_next(urllib.request.unquote(params.get("next", "/"))))
+                return self.redirect(url) if url else self.send(200, html_)
+            if path == "/auth/discord/callback":
+                url, html_ = auth_callback({k: urllib.request.unquote(v) for k, v in params.items()}, self.headers.get("Cookie"))
+                return self.redirect(url) if url else self.send(200, html_)
+            if path == "/auth/logout":
+                REQ.cookies.append("dv=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+                return self.redirect("/")
+            if path == "/api/v1/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                return self.websocket()
+            if path == "/api/v1/blocks":
+                return self.json([view(b) for b in need_live()[0]], 5)
+            if path == "/api/v1/fees/mempool-blocks":
+                return self.json(need_live()[1], 5)
+            if path == "/api/blocks/tip/height":
+                return self.send(200, str(need_live()[0][0]["height"]), "text/plain", 5)
+            m = re.fullmatch(r"/api/v1/mining/pool/([a-z0-9-]+)/blocks(?:/(epoch|14d))?", path)
+            if m and m.group(2):
+                return self.json(STATS.pool_blocks(m.group(1), epoch=True, budget=6), 5)
+            if m:
+                return self.json(STATS.pool_blocks(m.group(1)), 60)
+            m = re.fullmatch(r"/api/v1/mining/block/([0-9]+|[0-9a-fA-F]{64})", path)
+            if m:
+                return self.json(block_mining(m.group(1)), 3600)
+            m = re.fullmatch(r"/api/v1/block/([0-9]+|[0-9a-fA-F]{64})/stats", path)
+            if m:
+                return self.json(block_statistics(m.group(1)), 60)
+            if path == "/api/v1/blocks/history":
+                return self.json(STATS.history_rows(), 60)
+            if path == "/api/v1/chain-tips":
+                return self.json(chain_tips(), 30)
+            m = re.fullmatch(r"/api/v1/tx/([0-9a-fA-F]{64})/projection", path)
+            if m:
+                return self.json(tx_projection(m.group(1).lower()), 5)
+            m = re.fullmatch(r"/api/v1/address/([A-Za-z0-9]{14,90})", path)
+            if m and not address_allowed():
+                return self.send(403, json.dumps({"error": "address lookups are for members of the DATUM verified community: sign in at /auth/discord"}), "application/json")
+            if m:
+                st = address_scan(m.group(1))
+                return self.json(st["result"] if st["state"] == "done" else {"state": st["state"], "error": st.get("error")}, 0)
+            if path == "/forks":
+                return self.send(200, forks_page())
+            m = re.fullmatch(r"/address/([A-Za-z0-9]{14,90})", path)
+            if m and not address_allowed():
+                return self.send(200, page("Address", "<h1>Address</h1><section class=card>" + verify_box() + "</section>"))
+            if m:
+                return self.send(200, address_page(m.group(1)))
+            if path == "/fee-auction":
+                return self.send(200, auction_page())
+            if path == "/fee-auction.json":
+                return self.json(auction_parts(), 5)
+            if path == "/package-sorting":
+                return self.send(200, package_page())
+            if path == "/package-sorting.json":
+                return self.json(package_parts(), 5)
+            if path == "/block-assembly":
+                return self.send(200, assembly_page())
+            if path == "/block-assembly.json":
+                return self.json(assembly_parts(), 5)
+            if path == "/api/v1/block-template":
+                return self.json(block_template(), 8)
+            m = re.fullmatch(r"/api/v1/mining/period-blocks/([0-9]+)", path)
+            if m:
+                return self.json(STATS.period_blocks(int(m.group(1))), 30)
+            if path == "/api/v1/mining/next-block":
+                return self.json(next_block(), 10)
+            if path == "/api/v1/difficulty-adjustment":
+                return self.json(difficulty_adjustment(), 30)
+            if path == "/api/v1/fees/recommended":
+                return self.json(recommended_fees(), 10)
+            if path == "/api/v1/halving":
+                return self.json(halving(), 60)
+            if path == "/api/v1/network":
+                return self.json(network(), 10)
+            if path == "/api/v1/status":
+                with STATE_LOCK:
+                    s = {"live": not STATE["error"], "error": STATE["error"], "tip": STATE["blocks"][0]["height"] if STATE["blocks"] else None, "updated": STATE["at"],
+                         "mempool": STATE["mempool_count"], "pruned": STATE["info"].get("pruned"), "node": STATE["info"].get("subversion"), "chain": CHAIN, "syncing": STATE["info"].get("initialblockdownload"),
+                         "statistics": STATS.ready, "statisticsError": STATS.error, "pools": len(POOLS.tags) > 0}
+                return self.json(s)
+            m = re.fullmatch(r"/api/v1/mining/solo/(24h|14d|1w|1m|epoch)", path)
+            if m:
+                return self.json(STATS.solo(m.group(1)), 300)
+            m = re.fullmatch(r"/api/v1/mining/pool-hashrate/(24h|14d|1m|6m|1y|epoch)", path)
+            if m:
+                return self.json(STATS.pool_hashrate(m.group(1)), 300)
+            m = re.fullmatch(r"/api/v1/mining/(hashrate|pools)/(24h|14d|1w|1m|3m|6m|1y|epoch)", path)
+            if m:
+                kind, period = m.groups()
+                if kind == "hashrate":
+                    return self.json(STATS.hashrate("14d" if period == "1w" else "1m" if period == "3m" else period), 300)
+                return self.json(STATS.pools(period), 300)
+            if path == "/":
+                return self.send(200, home())
+            if path.startswith("/block/"):
+                return self.send(200, block_page(path[7:]))
+            if path.startswith("/tx/") and HEX64.fullmatch(path[4:]):
+                return self.send(200, tx_page(path[4:].lower(), params.get("b")))
+            if path == "/search":
+                q = urllib.request.unquote(params.get("q", "").replace("+", " ")).strip()
+                if q.isdigit():
+                    return self.redirect("/block/" + q)
+                if HEX64.fullmatch(q):
+                    try:
+                        NODE.call("getblockheader", q)
+                        return self.redirect("/block/" + q)
+                    except RuntimeError:
+                        return self.redirect("/tx/" + q.lower())
+                if ADDR_RE.fullmatch(q):
+                    return self.redirect("/address/" + q)
+                return self.send(404, page("Not found", "<h1>Nothing found</h1><p>Search for a block height, a block hash, a transaction id or an address.</p>"))
+            return self.send(404, page("Not found", "<h1>Not found</h1>"))
+        except (RuntimeError, ValueError, OSError, KeyError, IndexError, TypeError, ArithmeticError, struct.error) as exc:
+            if path.startswith("/api/"):
+                return self.send(503, json.dumps({"error": str(exc)}), "application/json")
+            return self.send(502, page("Error", "<h1>Something went wrong</h1><p class=err>" + html.escape(str(exc)) + "</p>"))
+
+    def redirect(self, to):
+        to = re.sub(r"[\x00-\x1f\x7f]", "", str(to))      # no line breaks in a header
+        self.send_response(302)
+        self.send_header("Location", to)
+        for c in getattr(REQ, "cookies", []):
+            self.send_header("Set-Cookie", c)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def websocket(self):
+        if _ws_open[0] >= MAX_WS:
+            return self.send(503, json.dumps({"error": "too many live connections"}), "application/json")
+        try:
+            blocks, mempool = need_live()         # not live (node syncing, not answering): no upgrade, so the page uses another source at once
+        except RuntimeError as exc:
+            return self.send(503, json.dumps({"error": str(exc)}), "application/json")
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        sock = self.connection
+        sock.settimeout(120)
+        _ws_open[0] += 1
+        try:
+            while True:
+                head = self.rfile.read(2)
+                if len(head) < 2:
+                    break
+                op, ln = head[0] & 0x0F, head[1] & 0x7F
+                if ln == 126:
+                    ln = struct.unpack(">H", self.rfile.read(2))[0]
+                elif ln == 127:
+                    ln = struct.unpack(">Q", self.rfile.read(8))[0]
+                if ln > MAX_WS_FRAME:
+                    break
+                mask = self.rfile.read(4) if head[1] & 0x80 else b"\0\0\0\0"
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(self.rfile.read(ln)))
+                if op == 8:
+                    break
+                if op == 9:
+                    with _send_lock:
+                        sock.sendall(bytes([0x8A, len(data)]) + data)
+                    continue
+                if op != 1:
+                    continue
+                try:
+                    msg = json.loads(data)
+                except ValueError:
+                    continue
+                if msg.get("action") == "want":
+                    with _clients_lock:
+                        _clients.add(sock)
+                    blocks, mempool = need_live()
+                    ws_send(sock, json.dumps({"blocks": [view(b) for b in blocks], "mempool-blocks": mempool}))
+                elif msg.get("action") == "ping":
+                    ws_send(sock, json.dumps({"pong": True}))
+        except (OSError, RuntimeError, ValueError):
+            pass
+        finally:
+            _ws_open[0] -= 1
+            with _clients_lock:
+                _clients.discard(sock)
+            self.close_connection = True
+
+
+def main():
+    threading.Thread(target=POOLS.load, daemon=True).start()
+    threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=stats_worker, daemon=True).start()
+    server = CappedServer(("0.0.0.0", PORT), Handler)
+    log("node " + os.environ["RPC_HOST"] + ":" + os.environ.get("RPC_PORT", "8332") + ", listening on port " + str(PORT))
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
