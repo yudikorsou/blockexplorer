@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1d1f31"/><stop offset="1" stop-color="#11131f"/></linearGradient>
+    <!-- the hashes.space accent: the "space" gradient of the wordmark -->
+    <linearGradient id="ac" gradientUnits="userSpaceOnUse" x1="40" y1="0" x2="226" y2="0"><stop offset="0" stop-color="#b58cff"/><stop offset="1" stop-color="#1bd8f4"/></linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="6" y="6" width="244" height="244" rx="50" fill="none" stroke="#ffffff" stroke-opacity=".07" stroke-width="2"/>
+  <!-- the hash sign in the white of the hashes.space fan -->
+  <g stroke="#ffffff" stroke-width="17" stroke-linecap="round" fill="none">
+    <line x1="104" y1="64" x2="88" y2="192"/>
+    <line x1="152" y1="64" x2="136" y2="192"/>
+  </g>
+  <!-- the bars carry on as the relayed signal -->
+  <g stroke="url(#ac)" stroke-width="17" stroke-linecap="round" fill="none">
+    <line x1="42" y1="105" x2="206" y2="105"/>
+    <line x1="42" y1="151" x2="206" y2="151"/>
+  </g>
+  <path d="M190 80 L226 128 L190 176" stroke="url(#ac)" stroke-width="17" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

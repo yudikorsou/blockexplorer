@@ -2,9 +2,9 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: hashrelay
-version: "1.4.0"
+version: "1.4.1"
 tagline: Real share hashes for your hashes.space dashboard
-icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
+icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/hashes-bitsrelay/icon.png
 description: >-
   A small relay that sits between your miner and your pool port (for example DATUM Gateway on this Umbrel).
   It passes everything on unchanged, and works out the real BLAKE2b hash of every share the pool accepts, so
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  Choose how long shares are kept: 24 hours, 7 days, 14 days or a month. The relay starts after you choose. At the end of each period hashrelay writes one Excel or PDF file with every share of that period (it downloads to your computer while the page is open, otherwise it waits on the Umbrel), then clears the saved shares and starts a new period, so the app never grows. Open the hashrelay page once after updating and choose a period; until then the relay stays off and your miner uses its second pool.
+  A new hashrelay logo.

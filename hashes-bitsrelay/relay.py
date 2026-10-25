@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""bitsrelay: a stratum relay with real share hashes (Python standard library only).
+"""hashrelay: a stratum relay with real share hashes (Python standard library only).
 
 Your miner connects here (port 23340) instead of straight to your pool port (for example DATUM Gateway on this
-Umbrel). Every byte is passed on unchanged. For each share the pool accepts, bitsrelay works out the real
+Umbrel). Every byte is passed on unchanged. For each share the pool accepts, hashrelay works out the real
 BLAKE2b hash of the share (the hash a block would need to beat) and offers it to the hashes.space dashboard,
 so the bits that fly into the block there are the real bits of your miner's work.
 
@@ -703,7 +703,7 @@ form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-
 <div class="card"><div class="stats">
 <div><b id="miners">–</b><span>miners connected</span></div><div><b id="checked">–</b><span>real hashes</span></div><div><b id="failed">–</b><span>failed the check</span></div></div></div>
 <div class="card"><h2>Point your miner here</h2>
-<p class="muted">In your miner's pool settings use this Umbrel's address and port <b>__PORT__</b>, with the worker name you use now, for example <code>stratum+tcp://umbrel.local:__PORT__</code> (or the IP address of your Umbrel). Keep your old pool as a second pool: if bitsrelay ever stops, the miner falls back to it.</p></div>
+<p class="muted">In your miner's pool settings use this Umbrel's address and port <b>__PORT__</b>, with the worker name you use now, for example <code>stratum+tcp://umbrel.local:__PORT__</code> (or the IP address of your Umbrel). Keep your old pool as a second pool: if hashrelay ever stops, the miner falls back to it.</p></div>
 <div class="card"><h2>Pool port to forward to</h2>
 <form id="f"><input id="h" aria-label="Pool host" value="__HOST__" size="26"><input id="p" aria-label="Pool port" value="__UPPORT__" size="7" inputmode="numeric"><button>Save</button><span id="msg" class="muted"></span></form>
 <p class="muted">The stratum address of the pool your miner hashes on now, for example DATUM Gateway on this Umbrel. <code>host.docker.internal</code> is this Umbrel itself.</p></div>
