@@ -50,8 +50,16 @@ try:
         saved = json.load(f)
     if isinstance(saved.get('upstream_host'), str) and isinstance(saved.get('upstream_port'), int):
         cfg.update({'upstream_host': saved['upstream_host'], 'upstream_port': saved['upstream_port']})
+    # how long shares are kept before they are saved to a file and cleared (chosen on the page before the relay starts)
+    if saved.get('keep') in ('24h', '7d', '14d', '30d') and saved.get('format') in ('xlsx', 'pdf', 'both') and isinstance(saved.get('period_end'), int):
+        cfg.update({'keep': saved['keep'], 'format': saved['format'], 'period_end': saved['period_end']})
 except Exception:
     pass
+
+KEEP = {'24h': 86400, '7d': 7 * 86400, '14d': 14 * 86400, '30d': 30 * 86400}
+KEEP_NAME = {'24h': '24 hours', '7d': '7 days', '14d': '14 days', '30d': 'a month (30 days)'}
+ARCHIVE_DIR = os.path.join(DATA, 'archives')
+ARCHIVE_INDEX = os.path.join(ARCHIVE_DIR, 'index.json')
 
 shares = deque(maxlen=1000)          # verified shares: {seq, t, ip, hash, diff}
 seq = 0
@@ -89,6 +97,10 @@ def db_init():
         db.execute('ALTER TABLE shares ADD COLUMN reason TEXT')
     db.execute('CREATE INDEX IF NOT EXISTS shares_prev ON shares (prev)')
     db.commit()
+    recount()
+
+
+def recount():
     n, first, ver, rej, stale = db.execute("SELECT COALESCE(SUM(status='accepted'),0), MIN(t), COALESCE(SUM(verified),0), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares").fetchone()
     stored.update({'count': n, 'first': first, 'verified': ver, 'rejected': rej, 'stale': stale})
 
@@ -559,6 +571,112 @@ def build_pdf(path, t0, t1, prev=None, label=None, anon=False):
 BUILDERS = {'xlsx': (build_xlsx, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'), 'pdf': (build_pdf, 'application/pdf'), 'csv': (build_csv, 'text/csv; charset=utf-8')}
 
 
+# ---------------------------------------------------------------- the automatic save: a file for every period, then the shares are cleared
+def save_config():
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f)
+        return True
+    except Exception as e:
+        note(f'could not save the setting ({e.__class__.__name__})')
+        return False
+
+
+def archives():
+    try:
+        with open(ARCHIVE_INDEX) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_archives(items):
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    tmp = ARCHIVE_INDEX + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(items, f)
+    os.replace(tmp, ARCHIVE_INDEX)
+
+
+def build_archive(t1):
+    """write the file(s) of everything saved up to t1; returns the index entries, or raises if a file is not good"""
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    con = db_connect()
+    first = con.execute('SELECT MIN(t) FROM shares WHERE t <= ?', (t1,)).fetchone()[0]
+    n = con.execute("SELECT COUNT(*) FROM shares WHERE t <= ? AND status = 'accepted'", (t1,)).fetchone()[0]
+    con.close()
+    stamp = f"{utc(first, '%Y-%m-%d')}_to_{utc(t1, '%Y-%m-%d')}-{int(t1 / 1000)}"
+    out = []
+    for kind in (['xlsx', 'pdf'] if cfg['format'] == 'both' else [cfg['format']]):
+        fn = BUILDERS[kind][0]
+        name = f'hashrelay-{stamp}.{kind}'
+        path = os.path.join(ARCHIVE_DIR, name)
+        con_part = path + '.part'
+        fn(con_part, None, t1, None, f"hashrelay: every share, {utc(first, '%Y-%m-%d')} to {utc(t1, '%Y-%m-%d')}", False)
+        if os.path.getsize(con_part) < 200:
+            raise ValueError('the file is empty')
+        if kind == 'xlsx':
+            with zipfile.ZipFile(con_part) as z:
+                if z.testzip() is not None:
+                    raise ValueError('the Excel file is damaged')
+        os.replace(con_part, path)
+        out.append({'name': name, 'kind': kind, 'size': os.path.getsize(path), 'from': first, 'to': t1, 'shares': n, 'made': int(time.time() * 1000), 'downloaded': None})
+    return out
+
+
+def clear_saved(t1):
+    """after the files are written and checked: delete what they hold and give the space back"""
+    flush()
+    db.execute('DELETE FROM shares WHERE t <= ?', (t1,))
+    db.commit()
+    try:
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        db.execute('VACUUM')
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    except Exception as e:
+        note(f'cleared, but could not shrink the file yet ({e.__class__.__name__})')
+    recount()
+
+
+async def archive_now(t1):
+    flush()
+    has = db.execute('SELECT COUNT(*) FROM shares WHERE t <= ?', (t1,)).fetchone()[0]
+    if has:
+        entries = await asyncio.get_event_loop().run_in_executor(None, lambda: build_archive(t1))
+        save_archives(archives() + entries)
+        clear_saved(t1)
+        note(f"saved {has:,} shares to {', '.join(e['name'] for e in entries)} and cleared them from the relay")
+    else:
+        note('the period ended with no shares to save')
+
+
+async def archiver():
+    while True:
+        await asyncio.sleep(20)
+        try:
+            if cfg.get('keep') and time.time() * 1000 >= cfg['period_end']:
+                t1 = int(time.time() * 1000)
+                await archive_now(t1)
+                cfg['period_end'] = t1 + KEEP[cfg['keep']] * 1000    # a new period starts when the old one ended
+                save_config()
+            # a file that was downloaded is removed from this Umbrel a day later (kept until then in case a download failed)
+            items = archives()
+            keep_items = []
+            for a in items:
+                if a.get('downloaded') and time.time() * 1000 - a['downloaded'] > 86400_000:
+                    try:
+                        os.unlink(os.path.join(ARCHIVE_DIR, a['name']))
+                    except FileNotFoundError:
+                        pass
+                    continue
+                keep_items.append(a)
+            if len(keep_items) != len(items):
+                save_archives(keep_items)
+        except Exception as e:
+            note(f"the automatic save failed, nothing was deleted, trying again ({e.__class__.__name__}: {e})")
+            await asyncio.sleep(580)
+
+
 # ---------------------------------------------------------------- web page and API
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>hashrelay</title><style>
@@ -577,6 +695,11 @@ form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-
 </style></head><body><main>
 <h1>hashrelay</h1>
 <p class="muted">A relay between your miner and your pool port. It passes everything on unchanged and works out the real hash of every accepted share for the hashes.space dashboard.</p>
+<div class="card" id="setup" hidden><h2>First, choose how long your shares are kept</h2>
+<p class="muted">Until you choose, the relay stays off (a miner with a second pool simply uses that). After each period hashrelay writes <b>one file with all the shares of that period</b> (Excel or PDF), then <b>deletes them from this app</b> and starts a new period, so the app never grows. Keep the page open and the file downloads to your computer by itself; otherwise it waits on this Umbrel until you download it, and nothing waiting is ever deleted.</p>
+<form id="kf"><select id="kp" aria-label="Period"><option value="24h">24 hours</option><option value="7d">7 days</option><option value="14d">14 days</option><option value="30d">A month (30 days)</option></select><select id="kt" aria-label="File"><option value="xlsx">Excel</option><option value="pdf">PDF</option><option value="both">Excel and PDF</option></select><button>Start hashrelay</button><span id="km" class="muted"></span></form></div>
+<div class="card" id="saves" hidden><h2>Automatic save</h2><p class="muted" id="sv"></p><ul id="al"></ul>
+<form id="kf2"><select id="kp2" aria-label="Period"><option value="24h">24 hours</option><option value="7d">7 days</option><option value="14d">14 days</option><option value="30d">A month (30 days)</option></select><select id="kt2" aria-label="File"><option value="xlsx">Excel</option><option value="pdf">PDF</option><option value="both">Excel and PDF</option></select><button>Change</button></form></div>
 <div class="card"><div class="stats">
 <div><b id="miners">–</b><span>miners connected</span></div><div><b id="checked">–</b><span>real hashes</span></div><div><b id="failed">–</b><span>failed the check</span></div></div></div>
 <div class="card"><h2>Point your miner here</h2>
@@ -597,7 +720,15 @@ async function load(){try{const s=await (await fetch('api/status')).json();
 $('miners').textContent=s.miners.length;$('checked').textContent=s.checked;$('failed').textContent=s.failed;$('failed').className=s.failed?'bad':'';
 $('ml').innerHTML=s.miners.map(m=>'<li><span class="mono">'+esc(m.ip)+'</span> '+esc(m.worker)+' · '+m.checked+' real hashes'+(m.last?' · last '+Math.round(Date.now()/1000-m.last)+' s ago':'')+'</li>').join('')||'<li class="muted">none yet</li>';
 $('st').textContent=s.stored.toLocaleString()+' accepted shares kept ('+s.storedVerified.toLocaleString()+' with a verified real hash)'+((s.storedRejected||s.storedStale)?', '+(s.storedRejected||0).toLocaleString()+' rejected and '+(s.storedStale||0).toLocaleString()+' stale also kept':'')+(s.storedSince?', since '+new Date(s.storedSince).toLocaleDateString():'')+'. Nothing is sent anywhere.';
+setup(s);
 $('ev').innerHTML=s.events.map(e=>'<li>'+new Date(e.t*1000).toLocaleTimeString()+' '+esc(e.text)+'</li>').join('');}catch(e){}}
+const got=new Set();
+function setup(s){const k=s.keep;$('setup').hidden=!!k;$('saves').hidden=!k;if(!k)return;
+$('sv').textContent='Every '+s.keepName+' hashrelay writes '+(s.format==='both'?'an Excel and a PDF file':s.format==='pdf'?'a PDF file':'an Excel file')+' with every share of the period, then clears them. Next save: '+new Date(s.periodEnd).toLocaleString()+'.';
+$('al').innerHTML=s.archives.map(a=>'<li><a href="api/archives/file?name='+encodeURIComponent(a.name)+'">'+esc(a.name)+'</a> <span class="muted">'+(a.size/1048576).toFixed(1)+' MB, '+a.shares.toLocaleString()+' shares'+(a.downloaded?', downloaded':', waiting to be downloaded')+'</span></li>').join('')||'<li class="muted">No file yet. The first one is made at the end of the period.</li>';
+for(const a of s.archives)if(!a.downloaded&&!got.has(a.name)){got.add(a.name);const l=document.createElement('a');l.href='api/archives/file?name='+encodeURIComponent(a.name);l.download=a.name;document.body.appendChild(l);l.click();l.remove();}}
+async function keepSave(e,p,t,m){e.preventDefault();const r=await fetch('api/archive-setting',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({keep:$(p).value,format:$(t).value})});const j=await r.json().catch(()=>({}));if(m)$(m).textContent=r.ok?'Started.':(j.error||'Not saved');load();}
+$('kf').onsubmit=e=>keepSave(e,'kp','kt','km');$('kf2').onsubmit=e=>keepSave(e,'kp2','kt2');
 function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 $('f').onsubmit=async e=>{e.preventDefault();const r=await fetch('api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({upstream_host:$('h').value.trim(),upstream_port:Number($('p').value)})});
 const j=await r.json();$('msg').textContent=r.ok?'Saved. New connections use it.':(j.error||'Not saved');};
@@ -637,6 +768,7 @@ async def web(r, w):
                 'checked': totals['checked'], 'failed': totals['failed'],
                 'stored': stored['count'], 'storedVerified': stored['verified'], 'storedRejected': stored['rejected'], 'storedStale': stored['stale'], 'storedSince': stored['first'],
                 'miners': [{'ip': ip, **{k: v for k, v in mm.items() if k in ('worker', 'checked', 'failed', 'last')}} for ip, mm in miners.items()],
+                'keep': cfg.get('keep'), 'keepName': KEEP_NAME.get(cfg.get('keep')), 'format': cfg.get('format'), 'periodEnd': cfg.get('period_end'), 'archives': archives(),
                 'events': list(events)})
         elif method == 'GET' and u.path == '/api/hashes':
             since = int((parse_qs(u.query).get('since') or ['0'])[0] or 0)
@@ -705,6 +837,48 @@ async def web(r, w):
                     os.unlink(tmp.name)
                 except Exception:
                     pass
+        elif method == 'GET' and u.path == '/api/archives/file':
+            name = (parse_qs(u.query).get('name') or [''])[0]
+            item = next((a for a in archives() if a['name'] == name), None)
+            if not item or not os.path.exists(os.path.join(ARCHIVE_DIR, name)):
+                status, ctype, out = 404, 'text/plain', b'not found'
+            else:
+                path = os.path.join(ARCHIVE_DIR, name)
+                size = os.path.getsize(path)
+                ctype = BUILDERS[item['kind']][1]
+                w.write(f'HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {size}\r\nContent-Disposition: attachment; filename="{name}"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n'.encode())
+                with open(path, 'rb') as fh:
+                    while True:
+                        chunk = fh.read(1 << 20)
+                        if not chunk:
+                            break
+                        w.write(chunk)
+                        await w.drain()
+                items = archives()      # the file left this Umbrel: mark it (it is removed a day later)
+                for a in items:
+                    if a['name'] == name and not a.get('downloaded'):
+                        a['downloaded'] = int(time.time() * 1000)
+                save_archives(items)
+                return
+        elif method == 'POST' and u.path == '/api/archive-setting':
+            try:
+                b = json.loads(body or b'{}')
+                keep, fmt = b['keep'], b['format']
+                if keep not in KEEP or fmt not in ('xlsx', 'pdf', 'both'):
+                    raise ValueError
+            except Exception:
+                status, ctype, out = json_resp({'error': 'Choose 24 hours, 7 days, 14 days or a month, and Excel, PDF or both.'}, 400)
+            else:
+                first = not cfg.get('keep')
+                start = int(time.time() * 1000) if first else cfg['period_end'] - KEEP[cfg['keep']] * 1000
+                cfg.update({'keep': keep, 'format': fmt, 'period_end': start + KEEP[keep] * 1000})
+                if save_config():
+                    note(f'shares are saved to a file every {KEEP_NAME[keep]} and then cleared')
+                    if first:
+                        await start_stratum()
+                    status, ctype, out = json_resp({'ok': True})
+                else:
+                    status, ctype, out = json_resp({'error': 'Could not save the setting.'}, 500)
         elif method == 'POST' and u.path == '/api/config':
             try:
                 b = json.loads(body or b'{}')
@@ -735,12 +909,25 @@ async def web(r, w):
             pass
 
 
+stratum_server = None
+
+
+async def start_stratum():
+    global stratum_server
+    if stratum_server is None:
+        stratum_server = await asyncio.start_server(relay, '0.0.0.0', STRATUM_PORT)
+        note(f"hashrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
+
+
 async def main():
     db_init()
     asyncio.ensure_future(flusher())
-    await asyncio.start_server(relay, '0.0.0.0', STRATUM_PORT)
+    asyncio.ensure_future(archiver())
     await asyncio.start_server(web, '0.0.0.0', WEB_PORT)
-    note(f"hashrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
+    if cfg.get('keep'):
+        await start_stratum()
+    else:
+        note('choose how long shares are kept on the hashrelay page: the relay starts after that')
     await asyncio.Event().wait()
 
 

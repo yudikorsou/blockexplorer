@@ -2,7 +2,7 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: hashrelay
-version: "1.3.2"
+version: "1.4.0"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
 description: >-
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  The app is now called hashrelay. Nothing else changes: your saved shares and settings stay.
+  Choose how long shares are kept: 24 hours, 7 days, 14 days or a month. The relay starts after you choose. At the end of each period hashrelay writes one Excel or PDF file with every share of that period (it downloads to your computer while the page is open, otherwise it waits on the Umbrel), then clears the saved shares and starts a new period, so the app never grows. Open the hashrelay page once after updating and choose a period; until then the relay stays off and your miner uses its second pool.
