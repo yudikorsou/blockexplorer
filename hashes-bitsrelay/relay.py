@@ -16,7 +16,7 @@ only offered after it passes a check against the share difficulty, so a wrong ha
   GET  /api/export.xlsx|pdf|csv?from=YYYY-MM-DD&to=YYYY-MM-DD   every accepted share ever relayed, as a download (behind the login)
 
 Every accepted share is kept in /data/shares.db (SQLite): time, worker, miner address, difficulty and, when it passed
-the check, its real hash. It is never deleted by bitsrelay.
+the check, its real hash. It is never deleted by hashrelay.
 
 The hash of a share on the Bitcoin BLAKE2b chain as a pooled miner computes it (header v2, "mode 0": the job's
 previous hash has its first 6 bytes zeroed), from Bitcoin Knots src/primitives/block.cpp, CBlockHeader::GetHash:
@@ -405,7 +405,7 @@ def build_xlsx(path, t0, t1, prev=None, label=None, anon=False):
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         # Summary sheet
         r = 1
-        rows = [[('b', label or 'bitsrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
+        rows = [[('b', label or 'hashrelay: shares relayed')], ['Period', period_text(t0, t1, s)], ['Generated', utc(time.time() * 1000) + ' UTC (days below are UTC days)'], [],
                 [('b', 'Accepted shares'), s['n']], [('b', 'With a verified real hash'), s['ver']], [('b', 'Rejected shares'), s['rej']], [('b', 'Stale shares'), s['stale']], [('b', 'Total difficulty (work)'), s['work']], [('b', 'Share difficulty at the time'), diff_text(s['diff'])], [],
                 [('b', 'Per worker')], [('b', 'Worker'), ('b', 'Accepted'), ('b', 'Verified hashes'), ('b', 'Total difficulty'), ('b', 'Rejected'), ('b', 'Stale'), ('b', 'First share'), ('b', 'Last share')]]
         for wk, n, v, d, rj, stl, f, l in s['workers']:
@@ -498,7 +498,7 @@ class Pdf:
         objs.append(None)   # placeholder to keep the numbering: object 6 is the first page
         objs.pop()
         for i, items in enumerate(self.pages):
-            foot = f'BT /F1 8 Tf {self.M} 24 Td (bitsrelay  -  page {i + 1} of {pages}) Tj ET'
+            foot = f'BT /F1 8 Tf {self.M} 24 Td (hashrelay  -  page {i + 1} of {pages}) Tj ET'
             stream = '\n'.join(items + [foot])
             objs.append(f'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {self.W} {self.H}] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents {7 + 2 * i} 0 R >>')
             objs.append(f'<< /Length {len(stream.encode("latin-1", "replace"))} >>\nstream\n{stream}\nendstream')
@@ -522,7 +522,7 @@ def build_pdf(path, t0, t1, prev=None, label=None, anon=False):
     con.close()
     p = Pdf()
     M = p.M
-    p.text(M, label or 'bitsrelay: shares relayed', 'F2', 20)
+    p.text(M, label or 'hashrelay: shares relayed', 'F2', 20)
     p.y -= 26
     p.line([f'Period: {period_text(t0, t1, s)}'], [M])
     p.line([f"Generated: {utc(time.time() * 1000)} UTC. Days are UTC days."], [M])
@@ -561,7 +561,7 @@ BUILDERS = {'xlsx': (build_xlsx, 'application/vnd.openxmlformats-officedocument.
 
 # ---------------------------------------------------------------- web page and API
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>bitsrelay</title><style>
+<title>hashrelay</title><style>
 :root{--bg:#10131c;--card:#1b1f2e;--line:#2b3146;--text:#eef0f6;--muted:#9aa3bd;--ok:#6fd286;--bad:#ff8a80;--link:#1bd8f4}
 @media(prefers-color-scheme:light){:root{--bg:#f4f5f9;--card:#fff;--line:#dcdfe9;--text:#161a28;--muted:#5d6580;--ok:#1c8a3a;--bad:#c62828;--link:#0a7f94}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}
@@ -575,7 +575,7 @@ button{font:inherit;font-weight:600;padding:8px 14px;border-radius:6px;border:0;
 a.btn{font-weight:600;padding:8px 14px;border-radius:6px;background:var(--link);color:#001;text-decoration:none}label input{margin-left:4px}
 form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-left:18px}li{margin:3px 0}.ok{color:var(--ok)}.bad{color:var(--bad)}
 </style></head><body><main>
-<h1>bitsrelay</h1>
+<h1>hashrelay</h1>
 <p class="muted">A relay between your miner and your pool port. It passes everything on unchanged and works out the real hash of every accepted share for the hashes.space dashboard.</p>
 <div class="card"><div class="stats">
 <div><b id="miners">–</b><span>miners connected</span></div><div><b id="checked">–</b><span>real hashes</span></div><div><b id="failed">–</b><span>failed the check</span></div></div></div>
@@ -690,7 +690,7 @@ async def web(r, w):
             try:
                 await asyncio.get_event_loop().run_in_executor(None, lambda: fn(tmp.name, t0, t1, prev, label, anon))
                 size = os.path.getsize(tmp.name)
-                name = f"bitsrelay-{slug}-{time.strftime('%Y-%m-%d', time.gmtime())}.{kind}"
+                name = f"hashrelay-{slug}-{time.strftime('%Y-%m-%d', time.gmtime())}.{kind}"
                 w.write(f'HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {size}\r\nContent-Disposition: attachment; filename="{name}"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n'.encode())
                 with open(tmp.name, 'rb') as fh:
                     while True:
@@ -740,7 +740,7 @@ async def main():
     asyncio.ensure_future(flusher())
     await asyncio.start_server(relay, '0.0.0.0', STRATUM_PORT)
     await asyncio.start_server(web, '0.0.0.0', WEB_PORT)
-    note(f"bitsrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
+    note(f"hashrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
     await asyncio.Event().wait()
 
 

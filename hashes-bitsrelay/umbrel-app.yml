@@ -1,8 +1,8 @@
 manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
-name: bitsrelay
-version: "1.3.1"
+name: hashrelay
+version: "1.3.2"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/frontend/public/coins/bitcoin-blake2b.png
 description: >-
@@ -16,7 +16,7 @@ description: >-
 
 
   It holds no keys, no payout address and no settings of your miner. A hash is only offered to the dashboard
-  after it passes a check against the share difficulty, so a wrong hash is never shown. If bitsrelay is stopped,
+  after it passes a check against the share difficulty, so a wrong hash is never shown. If hashrelay is stopped,
   a miner with a second pool entry falls back to it and keeps hashing.
 
 
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  The share difficulty at the time is shown per block (lowest, highest and how often the pool changed it mid-block) in the downloads and on the block pages. Rejected and stale shares are kept too.
+  The app is now called hashrelay. Nothing else changes: your saved shares and settings stay.
