@@ -18,7 +18,7 @@ services:
     environment:
       HOME: /tmp
       PORT: "3000"
-      STRATUM_PORT: "23340"
+      STRATUM_PORT: "3333"
       DATA_DIR: /data
       # where the relay forwards to until you set it on the app's page: this Umbrel, port 23339 (DATUM Gateway)
       UPSTREAM_HOST: host.docker.internal
@@ -27,7 +27,7 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       # the miner connects here
-      - "23340:23340"
+      - "3333:3333"
     volumes:
       - ${APP_DATA_DIR}/relay.py:/app/relay.py:ro
       - ${APP_DATA_DIR}/data:/data

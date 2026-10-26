@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """hashrelay: a stratum relay with real share hashes (Python standard library only).
 
-Your miner connects here (port 23340) instead of straight to your pool port (for example DATUM Gateway on this
+Your miner connects here (port 3333) instead of straight to your pool port (for example DATUM Gateway on this
 Umbrel). Every byte is passed on unchanged. For each share the pool accepts, hashrelay works out the real
 BLAKE2b hash of the share (the hash a block would need to beat) and offers it to the hashes.space dashboard,
 so the bits that fly into the block there are the real bits of your miner's work.
@@ -39,7 +39,7 @@ import zipfile
 from collections import deque
 from urllib.parse import parse_qs, urlparse
 
-STRATUM_PORT = int(os.environ.get('STRATUM_PORT', '23340'))
+STRATUM_PORT = int(os.environ.get('STRATUM_PORT', '3333'))
 WEB_PORT = int(os.environ.get('PORT', '3000'))
 DATA = os.environ.get('DATA_DIR', '/data')
 CONFIG_FILE = os.path.join(DATA, 'config.json')
