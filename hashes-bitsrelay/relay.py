@@ -36,6 +36,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import urllib.request
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,11 @@ try:
     # how long shares are kept before they are saved to a file and cleared (chosen on the page before the relay starts)
     if saved.get('keep') in ('24h', '7d', '14d', '30d') and saved.get('format') in ('xlsx', 'pdf', 'both') and isinstance(saved.get('period_end'), int):
         cfg.update({'keep': saved['keep'], 'format': saved['format'], 'period_end': saved['period_end']})
+    # the pool whose own record of your address hashrelay compares with its log (the pool credit check)
+    if isinstance(saved.get('audit_address'), str) and re.fullmatch(r'[A-Za-z0-9]{14,90}', saved['audit_address']):
+        cfg['audit_address'] = saved['audit_address']
+    if isinstance(saved.get('audit_url'), str) and re.fullmatch(r'https://[A-Za-z0-9.-]{3,120}', saved['audit_url']):
+        cfg['audit_url'] = saved['audit_url']
 except Exception:
     pass
 
@@ -99,6 +105,7 @@ def db_init():
     if 'reason' not in cols:     # what the pool said about a share it did not accept
         db.execute('ALTER TABLE shares ADD COLUMN reason TEXT')
     db.execute('CREATE INDEX IF NOT EXISTS shares_prev ON shares (prev)')
+    db.execute('CREATE TABLE IF NOT EXISTS pool_snap (t INTEGER PRIMARY KEY, hr REAL, work REAL, shares REAL, rej_work REAL, rej_shares REAL, window_work REAL, window_pct REAL, pool_hr REAL, window_sats REAL, online INTEGER)')
     db.commit()
     recount()
 
@@ -786,6 +793,142 @@ async def archiver():
             await asyncio.sleep(580)
 
 
+
+# ---------------------------------------------------------------- the pool credit check
+# Every 5 minutes hashrelay asks the pool (Lazarus) what it has credited to your payout address and keeps the answer next to
+# your share log. The check then compares, for the same periods, the work the pool credited with the work hashrelay saw the
+# gateway accept, and flags a gap that the pool's own rejected and stale shares do not explain.
+AUDIT_EVERY = 300
+HASHES_PER_DIFF = 2 ** 32
+audit_state = {'last': None, 'error': None, 'count': 0}
+
+
+def audit_get(path):
+    base = cfg.get('audit_url', 'https://pool.lazarus-xbt.xyz').rstrip('/')
+    req = urllib.request.Request(base + path, headers={'User-Agent': 'hashrelay', 'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read(2_000_000))
+
+
+def pick(d, key):
+    """a number of the miner record: the address total, else the sum over its workers"""
+    v = d.get(key)
+    if isinstance(v, (int, float)):
+        return float(v)
+    return float(sum(w.get(key) or 0 for w in d.get('workers') or [] if isinstance(w, dict)))
+
+
+def pool_snapshot():
+    addr = cfg.get('audit_address')
+    if not addr:
+        return None
+    m = audit_get('/api/miner/' + addr)
+    try:
+        pool_hr = float(audit_get('/api/pool').get('pool_hr_ghs') or 0)
+    except Exception:
+        pool_hr = 0.0
+    if not isinstance(m, dict) or not m.get('known', True):
+        raise ValueError('the pool does not know this address yet')
+    row = (int(time.time() * 1000), pick(m, 'hr_ghs'), pick(m, 'shares_lifetime') or pick(m, 'shares_acc'), pick(m, 'shares_acc'),
+           pick(m, 'diff_rej'), pick(m, 'shares_rej'), pick(m, 'window_work'), pick(m, 'window_percent'), pool_hr, pick(m, 'window_sats'), 1 if m.get('online') else 0)
+    with dblock:
+        db.execute('INSERT OR REPLACE INTO pool_snap VALUES (?,?,?,?,?,?,?,?,?,?,?)', row)
+        db.execute('DELETE FROM pool_snap WHERE t < ?', (row[0] - 35 * 86400_000,))
+        db.commit()
+    return row
+
+
+async def pool_collector():
+    await asyncio.sleep(20)
+    while True:
+        if cfg.get('audit_address'):
+            try:
+                row = await asyncio.get_running_loop().run_in_executor(None, pool_snapshot)
+                audit_state.update({'last': int(time.time() * 1000), 'error': None, 'count': audit_state['count'] + 1})
+            except Exception as e:
+                audit_state['error'] = f'{e.__class__.__name__}: {e}'[:200]
+        await asyncio.sleep(AUDIT_EVERY)
+
+
+def relay_work(con, t0, t1):
+    """what hashrelay logged between two moments: accepted work (sum of difficulties), accepted count, rejected and stale"""
+    a = con.execute("SELECT COALESCE(SUM(diff),0), COUNT(*) FROM shares WHERE status='accepted' AND t > ? AND t <= ?", (t0, t1)).fetchone()
+    o = {r[0]: (r[1], r[2]) for r in con.execute("SELECT status, COUNT(*), COALESCE(SUM(diff),0) FROM shares WHERE status != 'accepted' AND t > ? AND t <= ? GROUP BY status", (t0, t1))}
+    return {'work': a[0], 'shares': a[1], 'rejected': o.get('rejected', (0, 0))[0], 'stale': o.get('stale', (0, 0))[0],
+            'rejectedWork': o.get('rejected', (0, 0))[1] + o.get('stale', (0, 0))[1]}
+
+
+def judge(rw, dw, dr, period_s):
+    """rw: work hashrelay saw accepted; dw: work the pool credited; dr: work the pool rejected or called stale. -> (verdict, unexplained)"""
+    if rw <= 0 and dw <= 0:
+        return 'idle', 0.0
+    tol = 120.0 / max(period_s, 1) + 0.01     # the shares in flight at the edges of the period, and rounding
+    gap = rw - dw - dr                         # work hashrelay saw accepted that the pool neither credited nor rejected
+    ref = max(rw, dw, 1.0)
+    if abs(gap) <= tol * ref:
+        return 'ok', gap
+    return ('missing' if gap > 0 else 'extra'), gap
+
+
+def poolaudit_report():
+    con = db_connect()
+    try:
+        snaps = con.execute('SELECT t, hr, work, shares, rej_work, rej_shares, window_work, window_pct, pool_hr, window_sats, online FROM pool_snap ORDER BY t').fetchall()
+        out = {'configured': bool(cfg.get('audit_address')), 'address': ('…' + cfg['audit_address'][-6:]) if cfg.get('audit_address') else None,
+               'url': cfg.get('audit_url', 'https://pool.lazarus-xbt.xyz'), 'every': AUDIT_EVERY, 'snapshots': len(snaps),
+               'lastSnapshot': snaps[-1][0] if snaps else None, 'error': audit_state['error'], 'periods': [], 'window': None, 'hashrate': None, 'verdict': 'collecting'}
+        if not snaps:
+            return out
+        B = snaps[-1]
+        # a counter that goes down means the pool restarted it: only the part after the last reset is comparable
+        start = 0
+        for i in range(1, len(snaps)):
+            if snaps[i][2] < snaps[i - 1][2] - 1e-6:
+                start = i
+        usable = snaps[start:]
+        for label, hours in (('Last hour', 1), ('Last 6 hours', 6), ('Last 24 hours', 24), ('Since the first check', None)):
+            if hours is None:
+                A = usable[0]
+            else:
+                want = B[0] - hours * 3600_000
+                A = min(usable, key=lambda s: abs(s[0] - want))
+                if abs(A[0] - want) > 600_000 or A[0] >= B[0]:
+                    out['periods'].append({'label': label, 'verdict': 'collecting', 'hours': hours})
+                    continue
+            span = (B[0] - A[0]) / 1000.0
+            if span < 1200:
+                out['periods'].append({'label': label, 'verdict': 'collecting', 'hours': hours})
+                continue
+            r = relay_work(con, A[0], B[0])
+            dw, dr = B[2] - A[2], B[4] - A[4]
+            verdict, gap = judge(r['work'], dw, dr, span)
+            out['periods'].append({'label': label, 'hours': hours, 'from': A[0], 'to': B[0], 'relay': r,
+                                   'pool': {'work': dw, 'shares': B[3] - A[3], 'rejectedWork': dr, 'rejected': B[5] - A[5]},
+                                   'gap': gap, 'gapPercent': (gap / max(r['work'], dw, 1.0)) * 100, 'verdict': verdict})
+        # the window the pool pays from: the pool's window work against what hashrelay saw over the same stretch of time
+        if B[7] > 0 and B[6] > 0 and B[8] > 0:
+            total = B[6] / (B[7] / 100.0)                       # the whole window, in work
+            span = total / (B[8] * 1e9 / HASHES_PER_DIFF)       # how long the window lasts at the pool's hashrate, seconds
+            first = con.execute('SELECT MIN(t) FROM shares').fetchone()[0]
+            r = relay_work(con, B[0] - int(span * 1000), B[0])
+            covered = first is not None and first <= B[0] - int(span * 1000) + 300_000
+            tol = 0.05 + 300.0 / max(span, 1)
+            gap = r['work'] - B[6]
+            v = 'warming' if not covered else ('ok' if abs(gap) <= tol * max(r['work'], B[6], 1.0) else ('missing' if gap > 0 else 'extra'))
+            out['window'] = {'seconds': span, 'poolWork': B[6], 'relayWork': r['work'], 'percent': B[7], 'expectedPercent': (r['work'] / total) * 100, 'verdict': v, 'nextBlockSats': B[9]}
+        # the hashrate the pool shows against hashrelay's own over the last 30 minutes
+        r = relay_work(con, B[0] - 1800_000, B[0])
+        mine = r['work'] * HASHES_PER_DIFF / 1800.0 / 1e9
+        n = max(r['shares'], 1)
+        tol = 3.0 / math.sqrt(n) + 0.05
+        out['hashrate'] = {'poolGhs': B[1], 'relayGhs': mine, 'shares': r['shares'], 'verdict': 'ok' if B[1] > 0 and mine > 0 and abs(B[1] - mine) <= tol * max(B[1], mine) else ('idle' if B[1] == 0 and mine == 0 else 'differs')}
+        vs = [p['verdict'] for p in out['periods'] if p['verdict'] not in ('collecting', 'idle')]
+        out['verdict'] = 'missing' if 'missing' in vs else ('extra' if 'extra' in vs else ('ok' if vs else 'collecting'))
+        return out
+    finally:
+        con.close()
+
+
 # ---------------------------------------------------------------- web page and API
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>hashrelay</title><style>
@@ -816,6 +959,8 @@ form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-
 <div class="card"><h2>Pool port to forward to</h2>
 <form id="f"><input id="h" aria-label="Pool host" value="__HOST__" size="26"><input id="p" aria-label="Pool port" value="__UPPORT__" size="7" inputmode="numeric"><button>Save</button><span id="msg" class="muted"></span></form>
 <p class="muted">The stratum address of the pool your miner hashes on now, for example DATUM Gateway on this Umbrel. <code>host.docker.internal</code> is this Umbrel itself.</p></div>
+<div class="card"><h2>Pool credit check</h2><p class="muted">Every 5 minutes hashrelay asks the pool what it credited to your payout address and compares it with the shares it logged. Enter the payout address of your DATUM Gateway. The pool is read-only here; nothing is sent to it but the address.</p>
+<form id="pf"><input id="pa" aria-label="Payout address" placeholder="payout address" size="44" autocomplete="off"><input id="pu" aria-label="Pool address" value="https://pool.lazarus-xbt.xyz" size="30"><button>Save</button><span id="pm" class="muted"></span></form><p class="muted" id="ps"></p></div>
 <div class="card"><h2>Your shares</h2>
 <p class="muted" id="st">Every share the pool accepts is kept on this Umbrel, with its real hash when it passed the check. Nothing is sent anywhere.</p>
 <form id="dl"><label class="muted">From <input type="date" id="df"></label><label class="muted">To <input type="date" id="dt"></label>
@@ -846,7 +991,9 @@ const j=await r.json();$('msg').textContent=r.ok?'Saved. New connections use it.
 function links(){const q=(($('df').value?'from='+$('df').value:'')+($('dt').value?'&to='+$('dt').value:'')).replace(/^&/,'');
 for(const [id,k] of [['x','xlsx'],['d','pdf'],['c','csv']])$(id).href='api/export.'+k+(q?'?'+q:'');}
 $('df').onchange=$('dt').onchange=links;links();
-load();setInterval(load,2000);
+$('pf').onsubmit=async e=>{e.preventDefault();const r=await fetch('api/poolaudit-setting',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({address:$('pa').value.trim(),url:$('pu').value.trim()})});const j=await r.json();$('pm').textContent=r.ok?'Saved.':(j.error||'Not saved');pool();};
+async function pool(){try{const j=await (await fetch('api/hashes/poolaudit')).json();const t={ok:'The pool credits what hashrelay saw.',missing:'The pool credited LESS than hashrelay saw accepted.',extra:'The pool credited MORE than hashrelay saw.',collecting:'Collecting: the first comparison needs about an hour.'};$('ps').textContent=j.configured?('Address '+j.address+' · '+j.snapshots+' checks · '+(j.error?('last problem: '+j.error):(t[j.verdict]||''))):'Not set up yet.';}catch(e){}}
+load();pool();setInterval(load,2000);setInterval(pool,15000);
 </script></main></body></html>"""
 
 
@@ -886,6 +1033,29 @@ async def web(r, w):
         elif method == 'GET' and u.path == '/api/hashes':
             since = int((parse_qs(u.query).get('since') or ['0'])[0] or 0)
             status, ctype, out = json_resp({'stratumPort': STRATUM_PORT, 'seq': seq, 'shares': [s for s in shares if s['seq'] > since]})
+        elif method == 'GET' and u.path == '/api/hashes/poolaudit':
+            status, ctype, out = json_resp(await asyncio.get_running_loop().run_in_executor(None, poolaudit_report))
+        elif method == 'POST' and u.path == '/api/poolaudit-setting':
+            try:
+                b = json.loads(body or b'{}')
+                addr = str(b.get('address', '')).strip()
+                url = str(b.get('url') or 'https://pool.lazarus-xbt.xyz').strip().rstrip('/')
+                if addr and not re.fullmatch(r'[A-Za-z0-9]{14,90}', addr):
+                    raise ValueError
+                if not re.fullmatch(r'https://[A-Za-z0-9.-]{3,120}', url):
+                    raise ValueError
+            except Exception:
+                status, ctype, out = json_resp({'error': 'The payout address (letters and digits) and a pool address that starts with https://, please.'}, 400)
+            else:
+                if addr:
+                    cfg.update({'audit_address': addr, 'audit_url': url})
+                else:
+                    cfg.pop('audit_address', None)
+                if save_config():
+                    note('pool credit check ' + ('on for ' + addr[:6] + '…' + addr[-6:] if addr else 'off'))
+                    status, ctype, out = json_resp({'ok': True})
+                else:
+                    status, ctype, out = json_resp({'error': 'Could not save the setting.'}, 500)
         elif method == 'GET' and u.path == '/api/hashes/rounds':
             # the blocks the shares were made for (a round = all shares on jobs that build on the same previous block), newest first
             lim = max(1, min(200, int((parse_qs(u.query).get('limit') or ['30'])[0] or 30)))
@@ -1057,6 +1227,7 @@ async def main():
     db_init()
     asyncio.ensure_future(flusher())
     asyncio.ensure_future(archiver())
+    asyncio.ensure_future(pool_collector())
     await asyncio.start_server(web, '0.0.0.0', WEB_PORT)
     if cfg.get('keep'):
         await start_stratum()
