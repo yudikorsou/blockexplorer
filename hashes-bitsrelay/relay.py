@@ -105,6 +105,7 @@ def db_init():
     if 'reason' not in cols:     # what the pool said about a share it did not accept
         db.execute('ALTER TABLE shares ADD COLUMN reason TEXT')
     db.execute('CREATE INDEX IF NOT EXISTS shares_prev ON shares (prev)')
+    db.execute('CREATE TABLE IF NOT EXISTS pool_block (hash TEXT PRIMARY KEY, height INTEGER, t INTEGER, our_btc REAL, miner_btc REAL, window_pct REAL, window_work REAL, outputs INTEGER)')
     db.execute('CREATE TABLE IF NOT EXISTS pool_snap (t INTEGER PRIMARY KEY, hr REAL, work REAL, shares REAL, rej_work REAL, rej_shares REAL, window_work REAL, window_pct REAL, pool_hr REAL, window_sats REAL, online INTEGER)')
     db.commit()
     recount()
@@ -823,10 +824,12 @@ def pool_snapshot():
     if not addr:
         return None
     m = audit_get('/api/miner/' + addr)
+    pool_hr, pool_name = 0.0, None
     try:
-        pool_hr = float(audit_get('/api/pool').get('pool_hr_ghs') or 0)
+        pj = audit_get('/api/pool')
+        pool_hr, pool_name = float(pj.get('pool_hr_ghs') or 0), pj.get('name')
     except Exception:
-        pool_hr = 0.0
+        pass
     if not isinstance(m, dict) or not m.get('known', True):
         raise ValueError('the pool does not know this address yet')
     row = (int(time.time() * 1000), pick(m, 'hr_ghs'), pick(m, 'shares_lifetime') or pick(m, 'shares_acc'), pick(m, 'shares_acc'),
@@ -835,7 +838,42 @@ def pool_snapshot():
         db.execute('INSERT OR REPLACE INTO pool_snap VALUES (?,?,?,?,?,?,?,?,?,?,?)', row)
         db.execute('DELETE FROM pool_snap WHERE t < ?', (row[0] - 35 * 86400_000,))
         db.commit()
+    try:
+        check_blocks(addr, pool_name)
+        audit_state['blockError'] = None
+    except Exception as e:
+        audit_state['blockError'] = f'{e.__class__.__name__}: {e}'[:200]
     return row
+
+
+def check_blocks(addr, pool_name):
+    """the blocks the pool found since the first check: what the coinbase paid to your address, kept for the payout check"""
+    first = db.execute('SELECT MIN(t) FROM pool_snap').fetchone()[0]
+    if first is None:
+        return
+    blocks = audit_get('/api/blocks').get('blocks') or []
+    mine = [b for b in blocks if isinstance(b, dict) and b.get('id') and (not pool_name or b.get('pool') == pool_name) and (b.get('timestamp') or 0) * 1000 >= first]
+    new = [b for b in mine if not db.execute('SELECT 1 FROM pool_block WHERE hash = ?', (b['id'],)).fetchone()][:10]
+    if not new:
+        return
+    payouts = {}
+    try:
+        for p in audit_get('/api/payouts').get('payouts') or []:
+            payouts[p.get('hash')] = p
+    except Exception:
+        pass
+    for b in new:
+        f = audit_get('/api/found/' + b['id'])
+        outs = [o for o in f.get('outputs') or [] if isinstance(o, dict)]
+        ours = sum(float(o.get('btc') or 0) for o in outs if o.get('address') == addr)
+        total = float((payouts.get(b['id']) or {}).get('miner_btc') or 0) or sum(float(o.get('btc') or 0) for o in outs if o.get('to') != 'pool')
+        tb = int(b['timestamp']) * 1000
+        snap = db.execute('SELECT window_pct, window_work FROM pool_snap WHERE t <= ? AND t >= ? ORDER BY t DESC LIMIT 1', (tb, tb - 900_000)).fetchone()
+        if snap is None:
+            continue    # no check of ours close enough before the block: not compared
+        with dblock:
+            db.execute('INSERT OR REPLACE INTO pool_block VALUES (?,?,?,?,?,?,?,?)', (b['id'], b.get('height'), tb, ours, total, snap[0], snap[1], len(outs)))
+            db.commit()
 
 
 async def pool_collector():
@@ -876,7 +914,7 @@ def poolaudit_report():
         snaps = con.execute('SELECT t, hr, work, shares, rej_work, rej_shares, window_work, window_pct, pool_hr, window_sats, online FROM pool_snap ORDER BY t').fetchall()
         out = {'configured': bool(cfg.get('audit_address')), 'address': ('…' + cfg['audit_address'][-6:]) if cfg.get('audit_address') else None,
                'url': cfg.get('audit_url', 'https://pool.lazarus-xbt.xyz'), 'every': AUDIT_EVERY, 'snapshots': len(snaps),
-               'lastSnapshot': snaps[-1][0] if snaps else None, 'error': audit_state['error'], 'periods': [], 'window': None, 'hashrate': None, 'verdict': 'collecting'}
+               'lastSnapshot': snaps[-1][0] if snaps else None, 'error': audit_state['error'] or audit_state.get('blockError'), 'periods': [], 'window': None, 'hashrate': None, 'payouts': [], 'payoutVerdict': 'collecting', 'verdict': 'collecting'}
         if not snaps:
             return out
         B = snaps[-1]
@@ -922,7 +960,24 @@ def poolaudit_report():
         n = max(r['shares'], 1)
         tol = 3.0 / math.sqrt(n) + 0.05
         out['hashrate'] = {'poolGhs': B[1], 'relayGhs': mine, 'shares': r['shares'], 'verdict': 'ok' if B[1] > 0 and mine > 0 and abs(B[1] - mine) <= tol * max(B[1], mine) else ('idle' if B[1] == 0 and mine == 0 else 'differs')}
+        # the blocks the pool found: what the coinbase paid to your address against your window share just before the block
+        pays = []
+        for h, height, tb, ours, total, pct, ww, nouts in con.execute('SELECT hash, height, t, our_btc, miner_btc, window_pct, window_work, outputs FROM pool_block ORDER BY t DESC LIMIT 12'):
+            expected = total * pct / 100.0
+            if expected * 1e8 < 600:
+                v = 'dust'                       # too small to be a coinbase output: nothing is expected
+            elif ours <= 0:
+                v = 'missing'
+            else:
+                ratio = ours / expected
+                v = 'ok' if 0.85 <= ratio <= 1.15 else ('short' if ratio < 0.85 else 'extra')
+            pays.append({'hash': h, 'height': height, 't': tb, 'paid': ours, 'expected': expected, 'minerTotal': total, 'windowPercent': pct, 'outputs': nouts, 'verdict': v})
+        out['payouts'] = pays
         vs = [p['verdict'] for p in out['periods'] if p['verdict'] not in ('collecting', 'idle')]
+        pv = [p['verdict'] for p in pays[:5] if p['verdict'] not in ('dust', 'ok')]
+        if any(v in ('missing', 'short') for v in pv):
+            vs.append('missing')
+        out['payoutVerdict'] = 'collecting' if not [p for p in pays if p['verdict'] != 'dust'] else ('missing' if any(v in ('missing', 'short') for v in pv) else ('extra' if pv else 'ok'))
         out['verdict'] = 'missing' if 'missing' in vs else ('extra' if 'extra' in vs else ('ok' if vs else 'collecting'))
         return out
     finally:
