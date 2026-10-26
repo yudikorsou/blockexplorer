@@ -245,7 +245,7 @@ async def relay(client_r, client_w):
                     if bits >= need:
                         good = h
                         seq += 1
-                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff, 'prev': jprev, 'raw': raw_sub})
+                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff, 'prev': jprev, 'raw': raw_sub, 'reply': raw.decode('utf-8', 'replace')[:300]})
                         totals['checked'] += 1
                         if m is not None:
                             m['checked'] += 1

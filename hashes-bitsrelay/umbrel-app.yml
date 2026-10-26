@@ -2,7 +2,7 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: hashrelay
-version: "1.5.1"
+version: "1.5.2"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/hashes-bitsrelay/icon.png
 description: >-
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  See the real Stratum V1 lines: the app page now shows the raw mining.submit JSON-RPC your miner sends and the pool's reply, newest first (kept in memory only). The worker name in these lines is cut to its last 6 characters, and the dashboard shows the same line travelling through the ethernet cable of your miner.
+  See the real Stratum V1 lines: the app page now shows the raw mining.submit JSON-RPC your miner sends and the pool's reply, newest first (kept in memory only). The pool's reply to every share is sent to the dashboard too, so it can show the answer coming back. The worker name in these lines is cut to its last 6 characters, and the dashboard shows the same line travelling through the ethernet cable of your miner.
