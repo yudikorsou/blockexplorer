@@ -109,6 +109,18 @@ def recount():
 rawlog = collections.deque(maxlen=40)   # the last raw submits and the pool's replies, in memory only (never written to disk)
 
 
+def mask_submit(raw):
+    """the submit line as the miner sent it, with the worker name (it holds the payout address) cut to its last 6 characters: this list is open on the local network"""
+    try:
+        msg = json.loads(raw)
+        if isinstance(msg.get('params'), list) and msg['params']:
+            w = str(msg['params'][0])
+            msg['params'][0] = ('…' + w[-6:]) if len(w) > 6 else w
+        return json.dumps(msg, separators=(',', ':'), ensure_ascii=False)[:600]
+    except Exception:
+        return ''
+
+
 def record(t_ms, worker, ip, diff, h, prev=None, status='accepted', reason=None):
     """one share and the pool's answer to it. h: its hash when it passed the check (an accepted share), or the hash as computed for a share the pool did not accept"""
     ok = status == 'accepted' and bool(h)
@@ -205,7 +217,7 @@ async def relay(client_r, client_w):
                     h = share_hash(job, st['en1'], msg['params'])
             except Exception:
                 h = None
-            st['pending'][msg.get('id')] = (h, st['diff'], job['prev'] if job else None, raw.decode('utf-8', 'replace')[:600], time.time())
+            st['pending'][msg.get('id')] = (h, st['diff'], job['prev'] if job else None, mask_submit(raw), time.time())
 
     def on_pool(msg, raw=b''):
         global seq
@@ -233,7 +245,7 @@ async def relay(client_r, client_w):
                     if bits >= need:
                         good = h
                         seq += 1
-                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff, 'prev': jprev})
+                        shares.append({'seq': seq, 't': int(time.time() * 1000), 'ip': ip, 'hash': h, 'diff': diff, 'prev': jprev, 'raw': raw_sub})
                         totals['checked'] += 1
                         if m is not None:
                             m['checked'] += 1
