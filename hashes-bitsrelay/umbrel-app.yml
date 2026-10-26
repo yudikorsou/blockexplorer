@@ -2,7 +2,7 @@ manifestVersion: 1
 id: hashes-bitsrelay
 category: crypto
 name: hashrelay
-version: "1.5.4"
+version: "1.5.5"
 tagline: Real share hashes for your hashes.space dashboard
 icon: https://raw.githubusercontent.com/yudikorsou/blockexplorer/main/hashes-bitsrelay/icon.png
 description: >-
@@ -39,4 +39,4 @@ defaultPassword: ""
 submitter: yudikorsou
 submission: https://github.com/yudikorsou/blockexplorer
 releaseNotes: >-
-  See the real Stratum V1 lines: the app page now shows the raw mining.submit JSON-RPC your miner sends and the pool's reply, newest first (kept in memory only). The pool's reply to every share is sent to the dashboard too, so it can show the answer coming back. The worker name in these lines is cut to its last 6 characters, and the dashboard shows the same line travelling through the ethernet cable of your miner. The relay now also logs why each miner connection ended (which side closed it and after how long). The miner port is now 3333 (it was 23340): the firmware of some miners refuses to talk to the old port, so set your miner's pool to this Umbrel's address and port 3333.
+  Lower latency: shares and jobs now pass through hashrelay without waiting for anything else. Writing to the share database and the Hashrelay page's queries no longer run on the path your miner's traffic takes (a big database used to stall the relay for about 0.4 s every time the page asked), and the bytes are forwarded straight between the miner and the pool before they are looked at. See the real Stratum V1 lines: the app page now shows the raw mining.submit JSON-RPC your miner sends and the pool's reply, newest first (kept in memory only). The pool's reply to every share is sent to the dashboard too, so it can show the answer coming back. The worker name in these lines is cut to its last 6 characters, and the dashboard shows the same line travelling through the ethernet cable of your miner. The relay now also logs why each miner connection ended (which side closed it and after how long). The miner port is now 3333 (it was 23340): the firmware of some miners refuses to talk to the old port, so set your miner's pool to this Umbrel's address and port 3333.

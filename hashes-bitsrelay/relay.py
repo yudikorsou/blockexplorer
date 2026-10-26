@@ -34,9 +34,11 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 import zipfile
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
 STRATUM_PORT = int(os.environ.get('STRATUM_PORT', '3333'))
@@ -134,23 +136,36 @@ def record(t_ms, worker, ip, diff, h, prev=None, status='accepted', reason=None)
         stored['first'] = t_ms
 
 
+# All writing to the database happens on this one thread, never on the event loop that carries the miner's traffic:
+# a slow disk or a big query can then never hold up a share or a job.
+DB_THREAD = ThreadPoolExecutor(max_workers=1, thread_name_prefix='db')
+dblock = threading.RLock()
+
+
 def flush():
-    if not pending or db is None:
-        return
-    rows = pending[:]
-    del pending[:len(rows)]
-    try:
-        db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified, prev, status, reason) VALUES (?,?,?,?,?,?,?,?,?)', rows)
-        db.commit()
-    except Exception as e:
-        pending[:0] = rows      # try again next time; nothing is dropped
-        note(f'could not write the shares to disk ({e.__class__.__name__})')
+    with dblock:
+        if not pending or db is None:
+            return
+        rows = pending[:]
+        del pending[:len(rows)]
+        try:
+            db.executemany('INSERT INTO shares (t, worker, ip, diff, hash, verified, prev, status, reason) VALUES (?,?,?,?,?,?,?,?,?)', rows)
+            db.commit()
+        except Exception as e:
+            pending[:0] = rows      # try again next time; nothing is dropped
+            note(f'could not write the shares to disk ({e.__class__.__name__})')
+
+
+async def off_loop(fn, *args):
+    """run fn on the database thread and wait for it without blocking the event loop"""
+    return await asyncio.get_running_loop().run_in_executor(DB_THREAD, fn, *args)
 
 
 async def flusher():
     while True:
         await asyncio.sleep(1)
-        flush()
+        if pending:
+            await off_loop(flush)
 
 
 def note(text):
@@ -191,15 +206,104 @@ def share_hash(job, en1, params):
     return b2b(prev + bytes.fromhex(nonce) + bytes.fromhex(ntime) + stage1).hex()
 
 
-async def relay(client_r, client_w):
+class Side(asyncio.Protocol):
+    """one end of a relayed connection. Bytes read from this end are written to the other end straight from
+    data_received (no stream buffers, no extra task switches); reading them for the share check comes after."""
+
+    def __init__(self, link, name):
+        self.link, self.name, self.t, self.buf = link, name, None, b''
+
+    def connection_made(self, transport):
+        self.t = transport
+        self.link.made(self)
+
+    def data_received(self, data):
+        self.link.forward(self, data)
+
+    def eof_received(self):
+        return None          # close this end too: the relay ends when either side ends
+
+    def pause_writing(self):    # this end's output buffer is full: stop reading from the other end until it drains
+        o = self.link.other(self)
+        if o is not None and o.t is not None:
+            o.t.pause_reading()
+
+    def resume_writing(self):
+        o = self.link.other(self)
+        if o is not None and o.t is not None:
+            o.t.resume_reading()
+
+    def connection_lost(self, exc):
+        self.link.lost(self, exc)
+
+
+class Link:
+    def __init__(self):
+        self.client = Side(self, 'the miner')
+        self.pool = Side(self, 'DATUM')
+        self.pqueue = []
+        self.queue = []                 # what the miner sent before the pool connection was open
+        self.on_miner = self.on_pool = None
+        self.why = []
+        self.done = asyncio.get_running_loop().create_future()
+
+    def other(self, side):
+        return self.pool if side is self.client else self.client
+
+    def made(self, side):
+        pass
+
+    def forward(self, side, data):
+        o = self.other(side)
+        if side is self.client and (o.t is None or self.on_miner is None):
+            self.queue.append(data)     # sent on as soon as the pool is connected
+            return
+        if o.t is not None and not o.t.is_closing():
+            o.t.write(data)             # first: the bytes go on, unchanged
+        handle = self.on_miner if side is self.client else self.on_pool
+        if handle is None:
+            self.pqueue.append(data)    # the pool spoke before the relay was set up: looked at in a moment
+            return
+        self.check(side, handle, data)
+
+    def check(self, side, handle, data):
+        """look at the lines for the share check; the relay never breaks the connection"""
+        side.buf += data
+        if b'\n' in side.buf:
+            *lines, side.buf = side.buf.split(b'\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    handle(json.loads(line), line)
+                except Exception:
+                    pass
+        if len(side.buf) > 1 << 20:
+            side.buf = b''
+
+    def lost(self, side, exc):
+        self.why.append(f'{side.name} closed the connection' if exc is None else f'{side.name} error {exc.__class__.__name__}')
+        for s in (self.client, self.pool):
+            if s.t is not None:
+                s.t.close()
+        if not self.done.done():
+            self.done.set_result(None)
+
+
+async def relay(link):
     global seq
-    peer = client_w.get_extra_info('peername')
+    client_t = link.client.t
+    peer = client_t.get_extra_info('peername')
     ip = peer[0].replace('::ffff:', '') if peer else None
     try:
-        pool_r, pool_w = await asyncio.wait_for(asyncio.open_connection(cfg['upstream_host'], cfg['upstream_port']), 10)
+        await asyncio.wait_for(asyncio.get_running_loop().create_connection(lambda: link.pool, cfg['upstream_host'], cfg['upstream_port']), 10)
     except Exception as e:
         note(f"cannot reach the pool port {cfg['upstream_host']}:{cfg['upstream_port']} ({e.__class__.__name__})")
-        client_w.close()
+        client_t.close()
+        return
+    if link.done.done():            # the miner left while the pool connection was opening
+        link.pool.t.close()
         return
     st = {'en1': '', 'jobs': {}, 'diff': 1.0, 'pending': {}, 'worker': ''}
     m = miners.setdefault(ip, {'since': time.time(), 'checked': 0, 'failed': 0, 'rejected': 0, 'stale': 0, 'last': 0, 'worker': '', 'pool': f"{cfg['upstream_host']}:{cfg['upstream_port']}"}) if ip else None
@@ -269,46 +373,19 @@ async def relay(client_r, client_w):
         elif isinstance(msg.get('result'), list) and len(msg['result']) >= 2 and isinstance(msg['result'][1], str) and msg.get('id') is not None:
             st['en1'] = msg['result'][1]   # the reply to mining.subscribe: [[subscriptions], extranonce1, extranonce2_size]
 
-    why = []
-
-    async def pump(src, dst, handle, side=''):
-        buf = b''
-        try:
-            while True:
-                data = await src.read(65536)
-                if not data:
-                    why.append(f'{side} closed the connection')
-                    break
-                dst.write(data)
-                await dst.drain()
-                buf += data
-                while b'\n' in buf:
-                    line, buf = buf.split(b'\n', 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        handle(json.loads(line), line)
-                    except Exception:
-                        pass   # the relay never breaks the connection
-                if len(buf) > 1 << 20:
-                    buf = b''
-        except Exception as e:
-            why.append(f'{side} error {e.__class__.__name__}')
-
     note(f'miner connected from {ip}')
     t0 = time.time()
-    t1 = asyncio.ensure_future(pump(client_r, pool_w, on_miner, 'the miner'))
-    t2 = asyncio.ensure_future(pump(pool_r, client_w, on_pool, 'DATUM'))
-    await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+    link.on_pool = on_pool
+    link.on_miner = on_miner
+    pq, link.pqueue = link.pqueue, []
+    for data in pq:
+        link.check(link.pool, on_pool, data)
+    queued, link.queue = link.queue, []
+    for data in queued:
+        link.forward(link.client, data)
+    await link.done
+    why = link.why
     note(f"connection from {ip} ended after {time.time() - t0:.1f}s: {why[0] if why else 'unknown'}")
-    for t in (t1, t2):
-        t.cancel()
-    for w in (client_w, pool_w):
-        try:
-            w.close()
-        except Exception:
-            pass
     if ip and m is not None:
         m['since'] = m['since'] if time.time() - m['last'] < 120 else m['since']
 
@@ -660,13 +737,23 @@ def clear_saved(t1):
     recount()
 
 
-async def archive_now(t1):
+def count_until(t1):
     flush()
-    has = db.execute('SELECT COUNT(*) FROM shares WHERE t <= ?', (t1,)).fetchone()[0]
+    with dblock:
+        return db.execute('SELECT COUNT(*) FROM shares WHERE t <= ?', (t1,)).fetchone()[0]
+
+
+def clear_saved_locked(t1):
+    with dblock:
+        clear_saved(t1)
+
+
+async def archive_now(t1):
+    has = await off_loop(count_until, t1)
     if has:
         entries = await asyncio.get_event_loop().run_in_executor(None, lambda: build_archive(t1))
         save_archives(archives() + entries)
-        clear_saved(t1)
+        await off_loop(clear_saved_locked, t1)
         note(f"saved {has:,} shares to {', '.join(e['name'] for e in entries)} and cleared them from the relay")
     else:
         note('the period ended with no shares to save')
@@ -801,11 +888,16 @@ async def web(r, w):
             status, ctype, out = json_resp({'stratumPort': STRATUM_PORT, 'seq': seq, 'shares': [s for s in shares if s['seq'] > since]})
         elif method == 'GET' and u.path == '/api/hashes/rounds':
             # the blocks the shares were made for (a round = all shares on jobs that build on the same previous block), newest first
-            flush()
             lim = max(1, min(200, int((parse_qs(u.query).get('limit') or ['30'])[0] or 30)))
-            con = db_connect()
-            rows = con.execute("SELECT prev, SUM(status='accepted'), COALESCE(SUM(verified),0), MIN(t), MAX(t), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), SUM(status='rejected'), SUM(status='stale') FROM shares WHERE prev IS NOT NULL GROUP BY prev ORDER BY MAX(id) DESC LIMIT ?", (lim,)).fetchall()
-            con.close()
+
+            def rounds_query():
+                flush()
+                con = db_connect()
+                try:
+                    return con.execute("SELECT prev, SUM(status='accepted'), COALESCE(SUM(verified),0), MIN(t), MAX(t), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), SUM(status='rejected'), SUM(status='stale') FROM shares WHERE prev IS NOT NULL GROUP BY prev ORDER BY MAX(id) DESC LIMIT ?", (lim,)).fetchall()
+                finally:
+                    con.close()
+            rows = await asyncio.get_running_loop().run_in_executor(None, rounds_query)
             status, ctype, out = json_resp({'current': latest['prev'], 'rounds': [{'prev': p, 'count': n, 'verified': v, 'first': f, 'last': l, 'work': d, 'rejected': rj, 'stale': stl} for p, n, v, f, l, d, rj, stl in rows]})
         elif method == 'GET' and u.path == '/api/hashes/round':
             # every share of one block: newest first (live view) or the ones after an id (?after=)
@@ -814,14 +906,19 @@ async def web(r, w):
             if not re.fullmatch(r'[0-9a-fA-F]{64}', prev):
                 status, ctype, out = json_resp({'error': 'prev must be 64 hex characters'}, 400)
             else:
-                flush()
                 lim = max(1, min(2000, int((q.get('limit') or ['300'])[0] or 300)))
                 after = int((q.get('after') or ['0'])[0] or 0)
-                con = db_connect()
-                n, v, d, f, l, rj, stl = con.execute("SELECT COALESCE(SUM(status='accepted'),0), COALESCE(SUM(verified),0), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), MIN(t), MAX(t), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares WHERE prev = ?", (prev,)).fetchone()
-                rows = con.execute(f"SELECT id, t, {wsql(True)}, diff, hash, verified, status, reason FROM shares WHERE prev = ? AND id > ? ORDER BY id DESC LIMIT ?", (prev, after, lim)).fetchall()
-                dinfo = diff_info(con, ' WHERE prev = ?', (prev,))
-                con.close()
+
+                def round_query():
+                    flush()
+                    con = db_connect()
+                    try:
+                        tot = con.execute("SELECT COALESCE(SUM(status='accepted'),0), COALESCE(SUM(verified),0), COALESCE(SUM(CASE WHEN status='accepted' THEN diff ELSE 0 END),0), MIN(t), MAX(t), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares WHERE prev = ?", (prev,)).fetchone()
+                        rws = con.execute(f"SELECT id, t, {wsql(True)}, diff, hash, verified, status, reason FROM shares WHERE prev = ? AND id > ? ORDER BY id DESC LIMIT ?", (prev, after, lim)).fetchall()
+                        return tot, rws, diff_info(con, ' WHERE prev = ?', (prev,))
+                    finally:
+                        con.close()
+                (n, v, d, f, l, rj, stl), rows, dinfo = await asyncio.get_running_loop().run_in_executor(None, round_query)
                 status, ctype, out = json_resp({'prev': prev, 'total': n, 'verified': v, 'work': d, 'first': f, 'last': l, 'rejected': rj, 'stale': stl, 'difficulty': dinfo,
                                                 'shares': [{'id': i, 't': t, 'miner': wkr, 'diff': df, 'hash': h, 'bits': lz_bits(bytes.fromhex(h)) if h else None, 'verified': bool(vf), 'status': stt, 'reason': rs} for i, t, wkr, df, h, vf, stt, rs in rows]})
         elif method == 'GET' and re.fullmatch(r'/api/(export|hashes/round)\.(xlsx|pdf|csv)', u.path):
@@ -842,7 +939,7 @@ async def web(r, w):
                 anon = True    # open to the dashboard without a login: a worker (a payout address) is cut to its last 6 characters
                 label = re.sub(r'[^A-Za-z0-9 #.,:()-]', '', (q.get('label') or [''])[0])[:60].strip() or 'Block shares'
                 slug = re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-') or 'block'
-            flush()
+            await off_loop(flush)
             tmp = tempfile.NamedTemporaryFile(dir=tempfile.gettempdir(), suffix='.' + kind, delete=False)
             tmp.close()
             try:
@@ -938,10 +1035,21 @@ async def web(r, w):
 stratum_server = None
 
 
+def accept():
+    link = Link()
+    orig = link.client.connection_made
+
+    def started(transport):
+        orig(transport)
+        asyncio.ensure_future(relay(link))
+    link.client.connection_made = started
+    return link.client
+
+
 async def start_stratum():
     global stratum_server
     if stratum_server is None:
-        stratum_server = await asyncio.start_server(relay, '0.0.0.0', STRATUM_PORT)
+        stratum_server = await asyncio.get_running_loop().create_server(accept, '0.0.0.0', STRATUM_PORT)
         note(f"hashrelay: stratum on :{STRATUM_PORT}, page on :{WEB_PORT}, forwarding to {cfg['upstream_host']}:{cfg['upstream_port']}")
 
 
