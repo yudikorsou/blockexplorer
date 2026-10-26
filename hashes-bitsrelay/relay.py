@@ -25,6 +25,7 @@ previous hash has its first 6 bytes zeroed), from Bitcoin Knots src/primitives/b
 """
 import asyncio
 import calendar
+import collections
 import hashlib
 import html
 import json
@@ -103,6 +104,9 @@ def db_init():
 def recount():
     n, first, ver, rej, stale = db.execute("SELECT COALESCE(SUM(status='accepted'),0), MIN(t), COALESCE(SUM(verified),0), COALESCE(SUM(status='rejected'),0), COALESCE(SUM(status='stale'),0) FROM shares").fetchone()
     stored.update({'count': n, 'first': first, 'verified': ver, 'rejected': rej, 'stale': stale})
+
+
+rawlog = collections.deque(maxlen=40)   # the last raw submits and the pool's replies, in memory only (never written to disk)
 
 
 def record(t_ms, worker, ip, diff, h, prev=None, status='accepted', reason=None):
@@ -188,7 +192,7 @@ async def relay(client_r, client_w):
     st = {'en1': '', 'jobs': {}, 'diff': 1.0, 'pending': {}, 'worker': ''}
     m = miners.setdefault(ip, {'since': time.time(), 'checked': 0, 'failed': 0, 'rejected': 0, 'stale': 0, 'last': 0, 'worker': '', 'pool': f"{cfg['upstream_host']}:{cfg['upstream_port']}"}) if ip else None
 
-    def on_miner(msg):
+    def on_miner(msg, raw=b''):
         if msg.get('method') == 'mining.authorize' and m is not None and msg.get('params'):
             m['worker'] = str(msg['params'][0])[:60]
         if msg.get('method') == 'mining.authorize' and msg.get('params'):
@@ -201,9 +205,9 @@ async def relay(client_r, client_w):
                     h = share_hash(job, st['en1'], msg['params'])
             except Exception:
                 h = None
-            st['pending'][msg.get('id')] = (h, st['diff'], job['prev'] if job else None)
+            st['pending'][msg.get('id')] = (h, st['diff'], job['prev'] if job else None, raw.decode('utf-8', 'replace')[:600], time.time())
 
-    def on_pool(msg):
+    def on_pool(msg, raw=b''):
         global seq
         method = msg.get('method')
         if method == 'mining.set_difficulty':
@@ -218,7 +222,8 @@ async def relay(client_r, client_w):
             while len(st['jobs']) > 32:
                 st['jobs'].pop(next(iter(st['jobs'])))
         elif msg.get('id') in st['pending']:
-            h, diff, jprev = st['pending'].pop(msg['id'])
+            h, diff, jprev, raw_sub, t_sub = st['pending'].pop(msg['id'])
+            rawlog.appendleft({'t': int(t_sub * 1000), 'ip': ip, 'submit': raw_sub, 'reply': raw.decode('utf-8', 'replace')[:600], 'ms': int((time.time() - t_sub) * 1000), 'ok': msg.get('result') is True})
             if msg.get('result') is True:
                 good = None
                 if h:
@@ -268,7 +273,7 @@ async def relay(client_r, client_w):
                     if not line:
                         continue
                     try:
-                        handle(json.loads(line))
+                        handle(json.loads(line), line)
                     except Exception:
                         pass   # the relay never breaks the connection
                 if len(buf) > 1 << 20:
@@ -712,6 +717,7 @@ form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}ul{margin:0;padding-
 <form id="dl"><label class="muted">From <input type="date" id="df"></label><label class="muted">To <input type="date" id="dt"></label>
 <a class="btn" id="x" href="#">Excel</a><a class="btn" id="d" href="#">PDF</a><a class="btn" id="c" href="#">CSV</a></form>
 <p class="muted">Leave the dates empty for everything. Days are UTC days. The PDF holds the totals (per worker, per day, best hashes); Excel and CSV hold every share with its hash.</p></div>
+<div class="card"><h2>Raw Stratum V1 submits</h2><p class="muted">The real JSON-RPC lines your miner sends (<code>mining.submit</code>) and what the pool answers, newest first. Kept in memory only, the last 40, gone when the app restarts.</p><div id="raw" class="mono"><span class="muted">no submit yet</span></div></div>
 <div class="card"><h2>Miners</h2><ul id="ml"><li class="muted">none yet</li></ul></div>
 <div class="card"><h2>Latest events</h2><ul id="ev" class="mono"></ul></div>
 <script>
@@ -720,8 +726,9 @@ async function load(){try{const s=await (await fetch('api/status')).json();
 $('miners').textContent=s.miners.length;$('checked').textContent=s.checked;$('failed').textContent=s.failed;$('failed').className=s.failed?'bad':'';
 $('ml').innerHTML=s.miners.map(m=>'<li><span class="mono">'+esc(m.ip)+'</span> '+esc(m.worker)+' · '+m.checked+' real hashes'+(m.last?' · last '+Math.round(Date.now()/1000-m.last)+' s ago':'')+'</li>').join('')||'<li class="muted">none yet</li>';
 $('st').textContent=s.stored.toLocaleString()+' accepted shares kept ('+s.storedVerified.toLocaleString()+' with a verified real hash)'+((s.storedRejected||s.storedStale)?', '+(s.storedRejected||0).toLocaleString()+' rejected and '+(s.storedStale||0).toLocaleString()+' stale also kept':'')+(s.storedSince?', since '+new Date(s.storedSince).toLocaleDateString():'')+'. Nothing is sent anywhere.';
-setup(s);
+setup(s);raw();
 $('ev').innerHTML=s.events.map(e=>'<li>'+new Date(e.t*1000).toLocaleTimeString()+' '+esc(e.text)+'</li>').join('');}catch(e){}}
+async function raw(){try{const j=await (await fetch('api/raw')).json();$('raw').innerHTML=j.exchanges.map(x=>'<div style="margin:0 0 12px"><span class="muted">'+new Date(x.t).toLocaleTimeString()+' · '+esc(x.ip||'')+' · answered in '+x.ms+' ms</span><br>→ '+esc(x.submit)+'<br>← <span class="'+(x.ok?'ok':'bad')+'">'+esc(x.reply)+'</span></div>').join('')||'<span class="muted">no submit yet</span>';}catch(e){}}
 const got=new Set();
 function setup(s){const k=s.keep;$('setup').hidden=!!k;$('saves').hidden=!k;if(!k)return;
 $('sv').textContent='Every '+s.keepName+' hashrelay writes '+(s.format==='both'?'an Excel and a PDF file':s.format==='pdf'?'a PDF file':'an Excel file')+' with every share of the period, then clears them. Next save: '+new Date(s.periodEnd).toLocaleString()+'.';
@@ -770,6 +777,8 @@ async def web(r, w):
                 'miners': [{'ip': ip, **{k: v for k, v in mm.items() if k in ('worker', 'checked', 'failed', 'last')}} for ip, mm in miners.items()],
                 'keep': cfg.get('keep'), 'keepName': KEEP_NAME.get(cfg.get('keep')), 'format': cfg.get('format'), 'periodEnd': cfg.get('period_end'), 'archives': archives(),
                 'events': list(events)})
+        elif method == 'GET' and u.path == '/api/raw':
+            status, ctype, out = json_resp({'exchanges': list(rawlog)})
         elif method == 'GET' and u.path == '/api/hashes':
             since = int((parse_qs(u.query).get('since') or ['0'])[0] or 0)
             status, ctype, out = json_resp({'stratumPort': STRATUM_PORT, 'seq': seq, 'shares': [s for s in shares if s['seq'] > since]})
