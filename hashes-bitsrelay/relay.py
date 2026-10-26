@@ -269,12 +269,15 @@ async def relay(client_r, client_w):
         elif isinstance(msg.get('result'), list) and len(msg['result']) >= 2 and isinstance(msg['result'][1], str) and msg.get('id') is not None:
             st['en1'] = msg['result'][1]   # the reply to mining.subscribe: [[subscriptions], extranonce1, extranonce2_size]
 
-    async def pump(src, dst, handle):
+    why = []
+
+    async def pump(src, dst, handle, side=''):
         buf = b''
         try:
             while True:
                 data = await src.read(65536)
                 if not data:
+                    why.append(f'{side} closed the connection')
                     break
                 dst.write(data)
                 await dst.drain()
@@ -290,13 +293,15 @@ async def relay(client_r, client_w):
                         pass   # the relay never breaks the connection
                 if len(buf) > 1 << 20:
                     buf = b''
-        except Exception:
-            pass
+        except Exception as e:
+            why.append(f'{side} error {e.__class__.__name__}')
 
     note(f'miner connected from {ip}')
-    t1 = asyncio.ensure_future(pump(client_r, pool_w, on_miner))
-    t2 = asyncio.ensure_future(pump(pool_r, client_w, on_pool))
+    t0 = time.time()
+    t1 = asyncio.ensure_future(pump(client_r, pool_w, on_miner, 'the miner'))
+    t2 = asyncio.ensure_future(pump(pool_r, client_w, on_pool, 'DATUM'))
     await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+    note(f"connection from {ip} ended after {time.time() - t0:.1f}s: {why[0] if why else 'unknown'}")
     for t in (t1, t2):
         t.cancel()
     for w in (client_w, pool_w):
